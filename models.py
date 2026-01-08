@@ -1,40 +1,41 @@
 import os
 import sys
 from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, ForeignKey, Text
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, relationship
+from sqlalchemy.orm import sessionmaker, relationship, declarative_base
 from datetime import datetime
 
-# --- БЛОК НАСТРОЙКИ БД (ОБНОВЛЕННЫЙ) ---
+# --- ЧИСТАЯ НАСТРОЙКА БД ---
 
-# 1. Получаем переменную
 database_url = os.getenv("DATABASE_URL")
 
-# 2. Жесткая проверка: если переменной нет, роняем приложение с понятной ошибкой
+# 1. Проверка наличия переменной
 if not database_url:
-    print("CRITICAL ERROR: DATABASE_URL environment variable is NOT set!", file=sys.stderr)
-    raise ValueError("DATABASE_URL is missing. Please check Render Environment variables.")
+    print("CRITICAL ERROR: DATABASE_URL is missing in Environment Variables!", file=sys.stderr)
+    sys.exit(1) # Останавливаем программу жестко, если нет базы
 
-# 3. Авто-исправление формата ссылки для Render (postgres -> postgresql)
+# 2. Исправление ссылки для Render
 if database_url.startswith("postgres://"):
     database_url = database_url.replace("postgres://", "postgresql://", 1)
 
-# 4. Создаем подключение
+# 3. Создание движка и сессии
 try:
     engine = create_engine(database_url)
     SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
     Base = declarative_base()
-    print("Database connection initialized successfully.", file=sys.stderr)
+    print("Database connection configured successfully.", file=sys.stderr)
 except Exception as e:
-    print(f"Error connecting to database: {e}", file=sys.stderr)
-    raise e
+    print(f"Error creating DB engine: {e}", file=sys.stderr)
+    sys.exit(1)
 
-# --- КОНЕЦ БЛОКА ---
+# 4. Функция создания таблиц (обязательно должна быть здесь)
+def init_db():
+    try:
+        Base.metadata.create_all(bind=engine)
+        print("Tables initialized successfully.", file=sys.stderr)
+    except Exception as e:
+        print(f"Error initializing tables: {e}", file=sys.stderr)
 
-# Дальше должны идти твои классы (User, InviteCode, TranslationJob и т.д.)
-# Их не трогай.
-
-Base = declarative_base()
+# --- ДАЛЕЕ ИДУТ ТВОИ КЛАССЫ (НЕ УДАЛЯЙ ИХ) ---
 
 class User(Base):
     __tablename__ = "users"
