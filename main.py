@@ -10,10 +10,11 @@ from email.mime.text import MIMEText
 import jwt
 import boto3
 import uuid
+import sys
 
 app = FastAPI()
 
-# CORS
+# Настройка CORS (разрешаем всё для MVP)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], 
@@ -22,15 +23,22 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# --- ЗАПУСК ---
 @app.on_event("startup")
 def on_startup():
     init_db()
+    # Создаем инвайт-коды при старте, если их нет
     db = SessionLocal()
-    if not db.query(InviteCode).first():
-        db.add(InviteCode(code="START_S_20", tier="S", quota_words=60000, max_uses=20))
-        db.add(InviteCode(code="READER_M_20", tier="M", quota_words=200000, max_uses=20))
-        db.commit()
-    db.close()
+    try:
+        if not db.query(InviteCode).first():
+            print("Creating default invite codes...", file=sys.stderr)
+            db.add(InviteCode(code="START_S_20", tier="S", quota_words=60000, max_uses=20))
+            db.add(InviteCode(code="READER_M_20", tier="M", quota_words=200000, max_uses=20))
+            db.commit()
+    except Exception as e:
+        print(f"Error creating invite codes: {e}", file=sys.stderr)
+    finally:
+        db.close()
 
 def get_db():
     db = SessionLocal()
@@ -39,8 +47,9 @@ def get_db():
     finally:
         db.close()
 
-JWT_SECRET = os.getenv("JWT_SECRET", "secret")
+JWT_SECRET = os.getenv("JWT_SECRET", "secret_key_change_me")
 
+# S3/R2 Клиент
 s3 = boto3.client(
     's3',
     endpoint_url=os.getenv("R2_ENDPOINT"),
@@ -49,139 +58,144 @@ s3 = boto3.client(
 )
 BUCKET = os.getenv("R2_BUCKET")
 
-# --- Auth Endpoints ---
+# --- ЭНДПОИНТЫ ---
 
 @app.post("/auth/send-otp")
 def send_otp(email: str, db: Session = Depends(get_db)):
+    # 1. Генерируем код
     code = str(random.randint(100000, 999999))
-    expires = datetime.utcnow() + timedelta(minutes=10)
     
-    db_otp = OTP(email=email, code=code, expires_at=expires)
+    # 2. Сохраняем в базу
+    db_otp = OTP(email=email, code=code)
     db.add(db_otp)
     db.commit()
     
+    # 3. Отправляем Email
+    gmail_user = os.getenv("GMAIL_USER")
+    gmail_password = os.getenv("GMAIL_APP_PASSWORD")
+    
+    if not gmail_user or not gmail_password:
+        print("CRITICAL: GMAIL_USER or GMAIL_APP_PASSWORD not set!", file=sys.stderr)
+        raise HTTPException(status_code=500, detail="Email configuration missing on server")
+
     try:
-        msg = MIMEText(f"Ваш код входа: {code}")
-        msg['Subject'] = "Код подтверждения MVP Translator"
-        msg['From'] = os.getenv("GMAIL_USER")
+        msg = MIMEText(f"Your login code for AI Translator: {code}")
+        msg['Subject'] = "Your Login Code"
+        msg['From'] = gmail_user
         msg['To'] = email
 
-        with smtplib.SMTP('smtp.gmail.com', 587) as server:
+        # Используем стандартный порт 587 с TLS
+        with smtplib.SMTP("smtp.gmail.com", 587) as server:
             server.starttls()
-            server.login(os.getenv("GMAIL_USER"), os.getenv("GMAIL_APP_PASSWORD"))
+            server.login(gmail_user, gmail_password)
             server.send_message(msg)
-    except Exception as e:
-        print(f"Email error: {e}")
-        raise HTTPException(status_code=500, detail="Failed to send email")
+            
+        print(f"Email sent successfully to {email}", file=sys.stderr)
+        return {"message": "OTP sent"}
         
-    return {"message": "OTP sent"}
+    except Exception as e:
+        print(f"FAILED to send email: {e}", file=sys.stderr)
+        raise HTTPException(status_code=500, detail=f"Failed to send email: {str(e)}")
 
 @app.post("/auth/verify-otp")
 def verify_otp(email: str, code: str, db: Session = Depends(get_db)):
-    otp_record = db.query(OTP).filter(OTP.email == email, OTP.code == code).first()
-    if not otp_record or otp_record.expires_at < datetime.utcnow():
-        raise HTTPException(status_code=400, detail="Invalid or expired code")
+    # Ищем самый свежий код
+    otp_record = db.query(OTP).filter(OTP.email == email, OTP.code == code).order_by(OTP.id.desc()).first()
     
+    if not otp_record:
+        raise HTTPException(status_code=400, detail="Invalid code")
+    
+    # Проверяем или создаем юзера
     user = db.query(User).filter(User.email == email).first()
     if not user:
         user = User(email=email)
         db.add(user)
         db.commit()
+        db.refresh(user)
     
-    token = jwt.encode({"sub": user.email, "id": user.id}, JWT_SECRET, algorithm="HS256")
-    
-    db.delete(otp_record)
-    db.commit()
+    # Генерируем токен (простой JWT)
+    token = jwt.encode({"user_id": user.id, "email": user.email}, JWT_SECRET, algorithm="HS256")
     
     return {"token": token, "user": {"email": user.email, "plan": user.plan}}
 
-# --- User & Invites ---
-
-@app.get("/users/me")
-def get_me(token: str, db: Session = Depends(get_db)):
-    try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
-        user = db.query(User).filter(User.id == payload["id"]).first()
-        
-        period = datetime.utcnow().strftime("%Y-%m")
-        usage = db.query(Usage).filter(Usage.user_id == user.id, Usage.period == period).first()
-        used = usage.words_used if usage else 0
-        
-        return {
-            "email": user.email, 
-            "plan": user.plan, 
-            "quota": user.quota_words,
-            "used": used
-        }
-    except:
-        raise HTTPException(status_code=401, detail="Invalid token")
-
 @app.post("/users/activate-invite")
 def activate_invite(token: str, code: str, db: Session = Depends(get_db)):
-    payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
-    user = db.query(User).filter(User.id == payload["id"]).first()
-    
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+        user_id = payload["user_id"]
+    except:
+        raise HTTPException(status_code=401, detail="Invalid token")
+        
     invite = db.query(InviteCode).filter(InviteCode.code == code).first()
     if not invite:
-        raise HTTPException(status_code=404, detail="Code not found")
-    if invite.current_uses >= invite.max_uses:
+        raise HTTPException(status_code=400, detail="Invalid code")
+        
+    if invite.used_count >= invite.max_uses:
         raise HTTPException(status_code=400, detail="Code fully used")
         
+    user = db.query(User).filter(User.id == user_id).first()
     user.plan = invite.tier
     user.quota_words = invite.quota_words
-    invite.current_uses += 1
     
+    invite.used_count += 1
     db.commit()
-    return {"status": "activated", "plan": user.plan}
-
-# --- Jobs ---
+    
+    return {"plan": user.plan, "quota": user.quota_words}
 
 @app.post("/jobs/upload")
-def upload_book(
-    file: UploadFile = File(...), 
-    token: str = Form(...),
-    glossary: str = Form(None),
-    db: Session = Depends(get_db)
-):
-    payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
-    user_id = payload["id"]
+async def upload_file(token: str, file: UploadFile = File(...), db: Session = Depends(get_db)):
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+        user_id = payload["user_id"]
+    except:
+        raise HTTPException(status_code=401, detail="Invalid token")
+        
+    # Загрузка в R2
+    file_content = await file.read()
+    filename = f"{uuid.uuid4()}_{file.filename}"
+    r2_key = f"uploads/{user_id}/{filename}"
     
-    file_ext = file.filename.split('.')[-1]
-    key = f"inputs/{user_id}/{uuid.uuid4()}.{file_ext}"
-    s3.upload_fileobj(file.file, BUCKET, key)
+    s3.put_object(Bucket=BUCKET, Key=r2_key, Body=file_content)
     
+    # Создание задачи
     job = Job(
         user_id=user_id,
-        input_filename=file.filename,
-        input_key=key,
+        filename=file.filename,
+        r2_key_input=r2_key,
         status="queued"
     )
     db.add(job)
     db.commit()
     
-    # No Redis enqueue needed, worker polls DB
-    
     return {"job_id": job.id, "status": "queued"}
 
 @app.get("/jobs")
 def list_jobs(token: str, db: Session = Depends(get_db)):
-    payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
-    jobs = db.query(Job).filter(Job.user_id == payload["id"]).order_by(Job.created_at.desc()).all()
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+        user_id = payload["user_id"]
+    except:
+        raise HTTPException(status_code=401, detail="Invalid token")
+        
+    jobs = db.query(Job).filter(Job.user_id == user_id).order_by(Job.created_at.desc()).all()
     return jobs
 
 @app.get("/jobs/{job_id}/download")
-def download_link(job_id: int, token: str, db: Session = Depends(get_db)):
+def download_job(job_id: int, token: str, db: Session = Depends(get_db)):
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+    except:
+        raise HTTPException(status_code=401, detail="Invalid token")
+        
     job = db.query(Job).filter(Job.id == job_id).first()
-    if not job or not job.output_key_pdf:
+    if not job or not job.r2_key_output:
         raise HTTPException(status_code=404, detail="File not ready")
         
+    # Генерируем временную ссылку на скачивание (Presigned URL)
     url = s3.generate_presigned_url(
         'get_object',
-        Params={'Bucket': BUCKET, 'Key': job.output_key_pdf},
+        Params={'Bucket': BUCKET, 'Key': job.r2_key_output},
         ExpiresIn=3600
     )
-    
-    job.downloaded_at = datetime.utcnow()
-    db.commit()
     
     return {"url": url}
