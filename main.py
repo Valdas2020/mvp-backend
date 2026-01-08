@@ -84,9 +84,8 @@ def send_otp(email: str, db: Session = Depends(get_db)):
         msg['From'] = gmail_user
         msg['To'] = email
 
-        # Используем стандартный порт 587 с TLS
-        with smtplib.SMTP("smtp.gmail.com", 587) as server:
-            server.starttls()
+       # ПРОБУЕМ ПОРТ 465 (SSL) - он часто работает, когда 587 заблокирован
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
             server.login(gmail_user, gmail_password)
             server.send_message(msg)
             
