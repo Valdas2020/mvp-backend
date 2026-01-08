@@ -8,11 +8,9 @@ from datetime import datetime
 database_url = os.getenv("DATABASE_URL")
 
 if not database_url:
-    # Если переменной нет, выводим ошибку и останавливаемся, чтобы не мучить main.py
     print("CRITICAL ERROR: DATABASE_URL is missing in Environment Variables!", file=sys.stderr)
     sys.exit(1)
 
-# Исправляем ссылку для Render (postgres -> postgresql)
 if database_url.startswith("postgres://"):
     database_url = database_url.replace("postgres://", "postgresql://", 1)
 
@@ -35,10 +33,10 @@ def init_db():
 # --- 2. МОДЕЛИ (ТАБЛИЦЫ) ---
 
 class User(Base):
-    __tablename__ = "users"
+    __tablename__ = "app_users"  # Новое имя
     id = Column(Integer, primary_key=True, index=True)
     email = Column(String, unique=True, index=True)
-    plan = Column(String, nullable=True) # "S", "M"
+    plan = Column(String, nullable=True)
     quota_words = Column(Integer, default=0)
     created_at = Column(DateTime, default=datetime.utcnow)
 
@@ -46,27 +44,27 @@ class User(Base):
     usages = relationship("Usage", back_populates="user")
 
 class InviteCode(Base):
-    __tablename__ = "invite_codes"
+    __tablename__ = "app_invite_codes" # Новое имя
     id = Column(Integer, primary_key=True, index=True)
     code = Column(String, unique=True, index=True)
-    tier = Column(String) # "S" or "M"
+    tier = Column(String)
     quota_words = Column(Integer)
     max_uses = Column(Integer, default=1)
     used_count = Column(Integer, default=0)
 
 class OTP(Base):
-    __tablename__ = "otps"
+    __tablename__ = "app_otps" # Новое имя
     id = Column(Integer, primary_key=True, index=True)
     email = Column(String, index=True)
     code = Column(String)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 class Job(Base):
-    __tablename__ = "jobs"
+    __tablename__ = "app_jobs" # Новое имя
     id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"))
+    user_id = Column(Integer, ForeignKey("app_users.id")) # Ссылка на новое имя
     filename = Column(String)
-    status = Column(String, default="queued") # queued, processing, completed, failed
+    status = Column(String, default="queued")
     r2_key_input = Column(String)
     r2_key_output = Column(String, nullable=True)
     word_count = Column(Integer, default=0)
@@ -75,9 +73,9 @@ class Job(Base):
     user = relationship("User", back_populates="jobs")
 
 class Usage(Base):
-    __tablename__ = "usages"
+    __tablename__ = "app_usages" # Новое имя
     id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"))
+    user_id = Column(Integer, ForeignKey("app_users.id")) # Ссылка на новое имя
     words_deducted = Column(Integer)
     timestamp = Column(DateTime, default=datetime.utcnow)
 
