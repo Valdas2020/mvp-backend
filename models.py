@@ -1,8 +1,38 @@
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean, ForeignKey
+import os
+import sys
+from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, ForeignKey, Text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 from datetime import datetime
-import os
+
+# --- БЛОК НАСТРОЙКИ БД (ОБНОВЛЕННЫЙ) ---
+
+# 1. Получаем переменную
+database_url = os.getenv("DATABASE_URL")
+
+# 2. Жесткая проверка: если переменной нет, роняем приложение с понятной ошибкой
+if not database_url:
+    print("CRITICAL ERROR: DATABASE_URL environment variable is NOT set!", file=sys.stderr)
+    raise ValueError("DATABASE_URL is missing. Please check Render Environment variables.")
+
+# 3. Авто-исправление формата ссылки для Render (postgres -> postgresql)
+if database_url.startswith("postgres://"):
+    database_url = database_url.replace("postgres://", "postgresql://", 1)
+
+# 4. Создаем подключение
+try:
+    engine = create_engine(database_url)
+    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    Base = declarative_base()
+    print("Database connection initialized successfully.", file=sys.stderr)
+except Exception as e:
+    print(f"Error connecting to database: {e}", file=sys.stderr)
+    raise e
+
+# --- КОНЕЦ БЛОКА ---
+
+# Дальше должны идти твои классы (User, InviteCode, TranslationJob и т.д.)
+# Их не трогай.
 
 Base = declarative_base()
 
