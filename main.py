@@ -9,6 +9,7 @@ import smtplib
 from email.mime.text import MIMEText
 import jwt
 import boto3
+from botocore.client import Config # <--- ВАЖНЫЙ ИМПОРТ
 import uuid
 import sys
 
@@ -22,12 +23,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# S3/R2 Клиент (инициализируем глобально)
+# S3/R2 Клиент (инициализируем глобально с SigV4)
 s3 = boto3.client(
     's3',
     endpoint_url=os.getenv("R2_ENDPOINT"),
     aws_access_key_id=os.getenv("R2_ACCESS_KEY"),
-    aws_secret_access_key=os.getenv("R2_SECRET_KEY")
+    aws_secret_access_key=os.getenv("R2_SECRET_KEY"),
+    config=Config(signature_version='s3v4'), # <--- ВКЛЮЧАЕМ SigV4
+    region_name='auto'
 )
 BUCKET = os.getenv("R2_BUCKET")
 
@@ -35,29 +38,15 @@ BUCKET = os.getenv("R2_BUCKET")
 def on_startup():
     init_db()
     
-    # --- ДИАГНОСТИКА R2 (НАЧАЛО) ---
+    # --- ДИАГНОСТИКА R2 (Оставляем, полезно) ---
     print(f"\n--- R2 DIAGNOSTICS ---", file=sys.stderr)
     print(f"Endpoint: {os.getenv('R2_ENDPOINT')}", file=sys.stderr)
-    print(f"Target Bucket Env Var: '{BUCKET}'", file=sys.stderr)
     try:
-        # Пытаемся увидеть, какие бакеты вообще есть
         response = s3.list_buckets()
-        print("✅ Connection Successful! Available Buckets:", file=sys.stderr)
-        found = False
-        for b in response.get('Buckets', []):
-            print(f" - '{b['Name']}'", file=sys.stderr)
-            if b['Name'] == BUCKET:
-                found = True
-        
-        if found:
-            print(f"✅ SUCCESS: Target bucket '{BUCKET}' found in the list!", file=sys.stderr)
-        else:
-            print(f"❌ CRITICAL: Target bucket '{BUCKET}' NOT found in the list above!", file=sys.stderr)
-            
+        print("✅ Connection Successful!", file=sys.stderr)
     except Exception as e:
         print(f"❌ CONNECTION FAILED: {e}", file=sys.stderr)
     print(f"----------------------\n", file=sys.stderr)
-    # --- ДИАГНОСТИКА R2 (КОНЕЦ) ---
 
     db = SessionLocal()
     try:
@@ -158,7 +147,6 @@ async def upload_file(token: str, file: UploadFile = File(...), db: Session = De
     filename = f"{uuid.uuid4()}_{file.filename}"
     r2_key = f"uploads/{user_id}/{filename}"
     
-    # Загрузка
     s3.put_object(Bucket=BUCKET, Key=r2_key, Body=file_content)
     
     job = Job(
@@ -191,6 +179,8 @@ def download_job(job_id: int, token: str, db: Session = Depends(get_db)):
     job = db.query(Job).filter(Job.id == job_id).first()
     if not job or not job.r2_key_output:
         raise HTTPException(status_code=404, detail="File not ready")
+    
+    # Генерируем ссылку с SigV4
     url = s3.generate_presigned_url(
         'get_object',
         Params={'Bucket': BUCKET, 'Key': job.r2_key_output},
