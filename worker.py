@@ -12,8 +12,9 @@ from botocore.client import Config
 R2_BUCKET = os.getenv("R2_BUCKET")
 ROUTELLM_API_KEY = os.getenv("ROUTELLM_API_KEY")
 ROUTELLM_URL = "https://routellm.abacus.ai/v1/chat/completions"
-# Модель для перевода (дешевая и быстрая для тестов, для качества можно взять gpt-4o-mini или claude-3-haiku)
-MODEL = "mf_llama3_1_70b" 
+
+# МЕНЯЕМ МОДЕЛЬ НА НАДЕЖНУЮ
+MODEL = "gpt-4o-mini" 
 
 # S3/R2 Клиент
 s3 = boto3.client(
@@ -42,7 +43,6 @@ def translate_text(text):
         "Content-Type": "application/json"
     }
     
-    # Промпт для сохранения верстки
     system_prompt = (
         "You are a professional translator. Translate the following text from English to Russian. "
         "Keep the original formatting, line breaks, and structure exactly as they are. "
@@ -60,17 +60,23 @@ def translate_text(text):
     
     try:
         resp = requests.post(ROUTELLM_URL, headers=headers, json=data, timeout=60)
+        
+        # --- ДИАГНОСТИКА ОШИБОК LLM ---
+        if resp.status_code != 200:
+            print(f"⚠️ LLM Error {resp.status_code}: {resp.text}", file=sys.stderr)
+            
         resp.raise_for_status()
         return resp.json()['choices'][0]['message']['content']
     except Exception as e:
-        print(f"LLM Error: {e}", file=sys.stderr)
-        return text # Возвращаем оригинал при ошибке, чтобы не терять куски
+        print(f"❌ Translation Failed: {e}", file=sys.stderr)
+        return text # Возвращаем оригинал, чтобы не ломать файл
 
 def process_job(db: Session, job: Job):
     print(f"Processing Job {job.id}...", file=sys.stderr)
     
-    # 1. Скачиваем файл из R2
     local_filename = f"temp_{job.filename}"
+    output_filename = f"{job.filename}.txt"
+    
     try:
         s3.download_file(R2_BUCKET, job.r2_key_input, local_filename)
     except Exception as e:
@@ -79,7 +85,6 @@ def process_job(db: Session, job: Job):
         db.commit()
         return
 
-    # 2. Читаем PDF и переводим
     translated_content = []
     total_words = 0
     
@@ -89,34 +94,25 @@ def process_job(db: Session, job: Job):
             print(f"Total pages: {total_pages}", file=sys.stderr)
             
             for i, page in enumerate(pdf.pages):
-                # --- ЛОГИКА БЕЗ ОГРАНИЧЕНИЙ ---
                 text = page.extract_text()
                 if text:
-                    # Считаем слова (примерно)
                     words = len(text.split())
                     total_words += words
                     
-                    # Переводим
                     print(f"Translating page {i+1}/{total_pages}...", file=sys.stderr)
                     trans = translate_text(text)
                     translated_content.append(f"--- Page {i+1} ---\n{trans}\n\n")
                 
-                # Обновляем статус в базе каждые 5 страниц, чтобы видно было, что мы живы
                 if i % 5 == 0:
                     job.word_count = total_words
                     db.commit()
 
-        # 3. Сохраняем результат (пока в TXT)
-        output_text = "".join(translated_content)
-        output_filename = f"{job.filename}.txt"
         with open(output_filename, "w", encoding="utf-8") as f:
-            f.write(output_text)
+            f.write("".join(translated_content))
             
-        # 4. Загружаем обратно в R2
         r2_key_output = f"outputs/{job.user_id}/translated_{job.filename}.txt"
         s3.upload_file(output_filename, R2_BUCKET, r2_key_output)
         
-        # 5. Финализируем задачу
         job.status = "completed"
         job.r2_key_output = r2_key_output
         job.word_count = total_words
@@ -128,26 +124,23 @@ def process_job(db: Session, job: Job):
         job.status = "failed"
         db.commit()
     finally:
-        # Чистим мусор
         if os.path.exists(local_filename):
             os.remove(local_filename)
-        if os.path.exists(output_filename): # Исправлено: output_filename может не существовать при ошибке
+        if os.path.exists(output_filename):
              try: os.remove(output_filename)
              except: pass
 
 def run_worker():
-    print("Worker started... Waiting for jobs.", file=sys.stderr)
+    print(f"Worker started with model {MODEL}... Waiting for jobs.", file=sys.stderr)
     while True:
         db = SessionLocal()
         try:
-            # Ищем задачу со статусом 'queued'
             job = db.query(Job).filter(Job.status == "queued").first()
             if job:
                 job.status = "processing"
                 db.commit()
                 process_job(db, job)
             else:
-                # Спим, если нет задач
                 time.sleep(5)
         except Exception as e:
             print(f"Worker loop error: {e}", file=sys.stderr)
