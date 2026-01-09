@@ -1,126 +1,159 @@
 import os
 import time
-import json
-import httpx  # <--- Добавили этот импорт
-from sqlalchemy.orm import Session
-from models import SessionLocal, Job, Usage, User
-from openai import OpenAI
+import sys
 import boto3
-from botocore.exceptions import NoCredentialsError
-import pypdf
-import ebooklib
-from ebooklib import epub
-from bs4 import BeautifulSoup
-import io
+import pdfplumber
+import requests
+from sqlalchemy.orm import Session
+from models import SessionLocal, Job, User, Usage
+from botocore.client import Config
 
-# Настройки (можно брать из os.getenv напрямую для простоты воркера)
-ROUTELLM_API_KEY = os.getenv("ROUTELLM_API_KEY")
-ROUTELLM_BASE_URL = os.getenv("ROUTELLM_BASE_URL", "https://routellm.abacus.ai/v1")
-R2_ENDPOINT = os.getenv("R2_ENDPOINT")
-R2_ACCESS_KEY = os.getenv("R2_ACCESS_KEY")
-R2_SECRET_KEY = os.getenv("R2_SECRET_KEY")
+# --- НАСТРОЙКИ ---
 R2_BUCKET = os.getenv("R2_BUCKET")
+ROUTELLM_API_KEY = os.getenv("ROUTELLM_API_KEY")
+ROUTELLM_URL = "https://routellm.abacus.ai/v1/chat/completions"
+# Модель для перевода (дешевая и быстрая для тестов, для качества можно взять gpt-4o-mini или claude-3-haiku)
+MODEL = "mf_llama3_1_70b" 
 
-# --- ИНИЦИАЛИЗАЦИЯ КЛИЕНТОВ ---
-
-# 1. S3/R2 Клиент
+# S3/R2 Клиент
 s3 = boto3.client(
     's3',
-    endpoint_url=R2_ENDPOINT,
-    aws_access_key_id=R2_ACCESS_KEY,
-    aws_secret_access_key=R2_SECRET_KEY
+    endpoint_url=os.getenv("R2_ENDPOINT"),
+    aws_access_key_id=os.getenv("R2_ACCESS_KEY"),
+    aws_secret_access_key=os.getenv("R2_SECRET_KEY"),
+    config=Config(signature_version='s3v4'),
+    region_name='auto'
 )
 
-# 2. OpenAI/RouteLLM Клиент (С "ЛЕЧЕНИЕМ" ОШИБКИ PROXIES)
-# Мы создаем http_client вручную, чтобы библиотека OpenAI не пыталась 
-# сама создавать его с неправильными параметрами.
-client = OpenAI(
-    api_key=ROUTELLM_API_KEY,
-    base_url=ROUTELLM_BASE_URL,
-    http_client=httpx.Client() # <--- Вот это лечит ошибку
-)
-
-def process_job(job_id: int):
+def get_db():
     db = SessionLocal()
-    job = db.query(Job).filter(Job.id == job_id).first()
-    
-    if not job:
-        print(f"Job {job_id} not found")
-        db.close()
-        return
-
     try:
-        print(f"Starting job {job_id} for file {job.filename}")
-        job.status = "processing"
-        db.commit()
-
-        # 1. Скачиваем файл из R2
-        file_stream = io.BytesIO()
-        s3.download_fileobj(R2_BUCKET, job.r2_key_input, file_stream)
-        file_stream.seek(0)
-        
-        # 2. Извлекаем текст (Упрощенно для MVP: только PDF)
-        text_content = ""
-        if job.filename.lower().endswith(".pdf"):
-            reader = pypdf.PdfReader(file_stream)
-            for page in reader.pages:
-                text_content += page.extract_text() + "\n"
-        elif job.filename.lower().endswith(".epub"):
-             # Заглушка для EPUB, если вдруг загрузят
-             text_content = "EPUB parsing not implemented in MVP-lite yet."
-        else:
-             text_content = "Unsupported format."
-
-        # 3. Перевод (Упрощенно: берем первые 1000 символов для теста)
-        # В реальности тут будет цикл по чанкам
-        chunk = text_content[:2000] 
-        
-        response = client.chat.completions.create(
-            model="gpt-4o-mini", 
-            messages=[
-                {"role": "system", "content": "You are a professional translator. Translate the following text to Russian, keeping formatting."},
-                {"role": "user", "content": chunk}
-            ]
-        )
-        translated_text = response.choices[0].message.content
-
-        # 4. Сохраняем результат (просто текстовый файл для MVP)
-        output_filename = f"translated_{job.filename}.txt"
-        output_stream = io.BytesIO(translated_text.encode('utf-8'))
-        
-        output_key = f"outputs/{job.user_id}/{output_filename}"
-        s3.upload_fileobj(output_stream, R2_BUCKET, output_key)
-
-        # 5. Обновляем статус
-        job.status = "completed"
-        job.r2_key_output = output_key
-        db.commit()
-        print(f"Job {job_id} completed successfully.")
-
-    except Exception as e:
-        print(f"Error processing job {job_id}: {e}")
-        job.status = "failed"
-        db.commit()
+        yield db
     finally:
         db.close()
 
+def translate_text(text):
+    """Отправляет текст в RouteLLM"""
+    if not text or len(text.strip()) < 5:
+        return ""
+        
+    headers = {
+        "Authorization": f"Bearer {ROUTELLM_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    
+    # Промпт для сохранения верстки
+    system_prompt = (
+        "You are a professional translator. Translate the following text from English to Russian. "
+        "Keep the original formatting, line breaks, and structure exactly as they are. "
+        "Do not add any explanations, just the translation."
+    )
+    
+    data = {
+        "model": MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": text}
+        ],
+        "temperature": 0.3
+    }
+    
+    try:
+        resp = requests.post(ROUTELLM_URL, headers=headers, json=data, timeout=60)
+        resp.raise_for_status()
+        return resp.json()['choices'][0]['message']['content']
+    except Exception as e:
+        print(f"LLM Error: {e}", file=sys.stderr)
+        return text # Возвращаем оригинал при ошибке, чтобы не терять куски
+
+def process_job(db: Session, job: Job):
+    print(f"Processing Job {job.id}...", file=sys.stderr)
+    
+    # 1. Скачиваем файл из R2
+    local_filename = f"temp_{job.filename}"
+    try:
+        s3.download_file(R2_BUCKET, job.r2_key_input, local_filename)
+    except Exception as e:
+        print(f"Download failed: {e}", file=sys.stderr)
+        job.status = "failed"
+        db.commit()
+        return
+
+    # 2. Читаем PDF и переводим
+    translated_content = []
+    total_words = 0
+    
+    try:
+        with pdfplumber.open(local_filename) as pdf:
+            total_pages = len(pdf.pages)
+            print(f"Total pages: {total_pages}", file=sys.stderr)
+            
+            for i, page in enumerate(pdf.pages):
+                # --- ЛОГИКА БЕЗ ОГРАНИЧЕНИЙ ---
+                text = page.extract_text()
+                if text:
+                    # Считаем слова (примерно)
+                    words = len(text.split())
+                    total_words += words
+                    
+                    # Переводим
+                    print(f"Translating page {i+1}/{total_pages}...", file=sys.stderr)
+                    trans = translate_text(text)
+                    translated_content.append(f"--- Page {i+1} ---\n{trans}\n\n")
+                
+                # Обновляем статус в базе каждые 5 страниц, чтобы видно было, что мы живы
+                if i % 5 == 0:
+                    job.word_count = total_words
+                    db.commit()
+
+        # 3. Сохраняем результат (пока в TXT)
+        output_text = "".join(translated_content)
+        output_filename = f"{job.filename}.txt"
+        with open(output_filename, "w", encoding="utf-8") as f:
+            f.write(output_text)
+            
+        # 4. Загружаем обратно в R2
+        r2_key_output = f"outputs/{job.user_id}/translated_{job.filename}.txt"
+        s3.upload_file(output_filename, R2_BUCKET, r2_key_output)
+        
+        # 5. Финализируем задачу
+        job.status = "completed"
+        job.r2_key_output = r2_key_output
+        job.word_count = total_words
+        db.commit()
+        print(f"Job {job.id} COMPLETED!", file=sys.stderr)
+        
+    except Exception as e:
+        print(f"Processing failed: {e}", file=sys.stderr)
+        job.status = "failed"
+        db.commit()
+    finally:
+        # Чистим мусор
+        if os.path.exists(local_filename):
+            os.remove(local_filename)
+        if os.path.exists(output_filename): # Исправлено: output_filename может не существовать при ошибке
+             try: os.remove(output_filename)
+             except: pass
+
 def run_worker():
-    print("Worker started. Polling for jobs...")
+    print("Worker started... Waiting for jobs.", file=sys.stderr)
     while True:
         db = SessionLocal()
-        # Ищем задачу со статусом 'queued'
-        job = db.query(Job).filter(Job.status == "queued").first()
-        
-        if job:
-            job_id = job.id
-            # Сразу меняем статус, чтобы другие воркеры (если будут) не взяли
-            # Но для надежности лучше делать это внутри транзакции с row locking, 
-            # для MVP просто берем и закрываем сессию, передавая ID в функцию
+        try:
+            # Ищем задачу со статусом 'queued'
+            job = db.query(Job).filter(Job.status == "queued").first()
+            if job:
+                job.status = "processing"
+                db.commit()
+                process_job(db, job)
+            else:
+                # Спим, если нет задач
+                time.sleep(5)
+        except Exception as e:
+            print(f"Worker loop error: {e}", file=sys.stderr)
+            time.sleep(5)
+        finally:
             db.close()
-            process_job(job_id)
-        else:
-            db.close()
-            time.sleep(5) # Спим 5 секунд, если нет задач
 
 if __name__ == "__main__":
     run_worker()
