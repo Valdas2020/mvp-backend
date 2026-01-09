@@ -3,8 +3,8 @@ uvicorn
 sqlalchemy==2.0.36
 psycopg2-binary
 python-multipart
-python-jose[cryptography]
 passlib[bcrypt]
 boto3
 pdfplumber
 requests
+PyJWT
