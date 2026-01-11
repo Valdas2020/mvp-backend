@@ -74,7 +74,12 @@ JWT_SECRET = os.getenv("JWT_SECRET", "secret_key_change_me")
 @app.post("/auth/alpha-login")
 def alpha_login(invite_code: str = Form(...), name: str = Form(...), email: str = Form(...), db: Session = Depends(get_db)):
     # 1. Проверяем инвайт
-    invite = db.query(InviteCode).filter(InviteCode.code == invite_code).first()
+    print(f"[ALPHA LOGIN] invite_code raw: '{invite_code}'", flush=True)
+
+invite = db.query(InviteCode).filter(
+    InviteCode.code == invite_code.strip()
+).first()
+    
     if not invite:
         raise HTTPException(status_code=400, detail="Неверный код приглашения")
     
