@@ -79,6 +79,14 @@ def alpha_login(invite_code: str = Form(...), name: str = Form(...), email: str 
 
     print(f"[ALPHA LOGIN] raw='{raw}' cleaned='{cleaned}' normalized='{normalized}'", flush=True)
 
+    # Диагностика: сколько кодов видит backend
+    total_codes = db.query(InviteCode).count()
+    print(f"[DB CHECK] Total invite_codes in backend DB: {total_codes}", flush=True)
+    
+    # Покажем первые 3 кода
+    sample = db.query(InviteCode).limit(3).all()
+    print(f"[DB CHECK] Sample codes: {[c.code for c in sample]}", flush=True)
+
     invite = db.query(InviteCode).filter(InviteCode.code == normalized).first()
 
     if not invite:
