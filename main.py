@@ -38,25 +38,27 @@ BUCKET = os.getenv("R2_BUCKET")
 def on_startup():
     init_db()
     
-    # --- ДИАГНОСТИКА R2 (Оставляем, полезно) ---
-    print(f"\n--- R2 DIAGNOSTICS ---", file=sys.stderr)
-    print(f"Endpoint: {os.getenv('R2_ENDPOINT')}", file=sys.stderr)
-    try:
-        response = s3.list_buckets()
-        print("✅ Connection Successful!", file=sys.stderr)
-    except Exception as e:
-        print(f"❌ CONNECTION FAILED: {e}", file=sys.stderr)
-    print(f"----------------------\n", file=sys.stderr)
-
     db = SessionLocal()
     try:
-        if not db.query(InviteCode).first():
-            print("Creating default invite codes...", file=sys.stderr)
-            db.add(InviteCode(code="START_S_20", tier="S", quota_words=60000, max_uses=20))
-            db.add(InviteCode(code="READER_M_20", tier="M", quota_words=200000, max_uses=20))
+        # Проверяем, есть ли наш конкретный код
+        target_code = "ALPHA_M_30"
+        exists = db.query(InviteCode).filter(InviteCode.code == target_code).first()
+        
+        if not exists:
+            print(f"Creating code {target_code}...", file=sys.stderr)
+            db.add(InviteCode(
+                code=target_code, 
+                tier="M", 
+                quota_words=200000, 
+                max_uses=100  # Сделаем 100 использований, чтобы не мучаться
+            ))
             db.commit()
+            print(f"✅ Code {target_code} created successfully!", file=sys.stderr)
+        else:
+            print(f"ℹ️ Code {target_code} already exists in this DB.", file=sys.stderr)
+            
     except Exception as e:
-        print(f"Error creating invite codes: {e}", file=sys.stderr)
+        print(f"❌ Error in on_startup: {e}", file=sys.stderr)
     finally:
         db.close()
 
