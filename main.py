@@ -73,40 +73,38 @@ JWT_SECRET = os.getenv("JWT_SECRET", "secret_key_change_me")
 
 @app.post("/auth/alpha-login")
 def alpha_login(invite_code: str = Form(...), name: str = Form(...), email: str = Form(...), db: Session = Depends(get_db)):
-    print(f"[ALPHA LOGIN] invite_code raw: '{invite_code}'", flush=True)
-    
-    # Проверяем инвайт (с trim пробелов)
-    invite = db.query(InviteCode).filter(
-        InviteCode.code == invite_code.strip()
-    ).first()
-    
+    raw = invite_code
+    cleaned = invite_code.strip()
+    normalized = cleaned.upper()
+
+    print(f"[ALPHA LOGIN] raw='{raw}' cleaned='{cleaned}' normalized='{normalized}'", flush=True)
+
+    invite = db.query(InviteCode).filter(InviteCode.code == normalized).first()
+
     if not invite:
         raise HTTPException(status_code=400, detail="Неверный код приглашения")
-    
+
     if invite.used_count >= invite.max_uses:
         raise HTTPException(status_code=400, detail="Код полностью использован")
-    
-    # Создаем "одноразового" пользователя
+
     user = User(
-        email=email, 
-        plan=invite.tier, 
+        email=email,
+        plan=invite.tier,
         quota_words=invite.quota_words
     )
     db.add(user)
-    
-    # Обновляем счетчик инвайта
+
     invite.used_count += 1
     db.commit()
     db.refresh(user)
-    
-    # Генерируем токен для сессии
+
     token = jwt.encode({
-        "user_id": user.id, 
+        "user_id": user.id,
         "email": user.email,
         "name": name,
         "exp": datetime.utcnow() + timedelta(days=1)
     }, JWT_SECRET, algorithm="HS256")
-    
+
     return {"token": token, "user": {"email": user.email, "plan": user.plan, "name": name}}
   
     
