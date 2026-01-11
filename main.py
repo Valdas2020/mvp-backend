@@ -71,48 +71,40 @@ JWT_SECRET = os.getenv("JWT_SECRET", "secret_key_change_me")
 
 # --- ЭНДПОИНТЫ ---
 
-@app.post("/auth/send-otp")
-def send_otp(email: str, db: Session = Depends(get_db)):
-    code = str(random.randint(100000, 999999))
-    db_otp = OTP(email=email, code=code)
-    db.add(db_otp)
+@app.post("/auth/alpha-login")
+def alpha_login(invite_code: str = Form(...), name: str = Form(...), email: str = Form(...), db: Session = Depends(get_db)):
+    # 1. Проверяем инвайт
+    invite = db.query(InviteCode).filter(InviteCode.code == invite_code).first()
+    if not invite:
+        raise HTTPException(status_code=400, detail="Неверный код приглашения")
+    
+    if invite.used_count >= invite.max_uses:
+        raise HTTPException(status_code=400, detail="Код полностью использован")
+    
+    # 2. Создаем "одноразового" пользователя
+    # Мы используем email + время, чтобы не было конфликтов, если один человек зайдет дважды
+    unique_email = f"{email}_{int(time.time())}" 
+    user = User(
+        email=email, 
+        plan=invite.tier, 
+        quota_words=invite.quota_words
+    )
+    db.add(user)
+    
+    # 3. Обновляем счетчик инвайта
+    invite.used_count += 1
     db.commit()
+    db.refresh(user)
     
-    print(f"!!! LOGIN CODE FOR {email}: {code} !!!", file=sys.stderr)
+    # 4. Генерируем токен для сессии
+    token = jwt.encode({
+        "user_id": user.id, 
+        "email": user.email,
+        "name": name,
+        "exp": datetime.utcnow() + timedelta(days=1) # Сессия на 24 часа
+    }, JWT_SECRET, algorithm="HS256")
     
-    gmail_user = os.getenv("GMAIL_USER")
-    gmail_password = os.getenv("GMAIL_APP_PASSWORD")
-    
-    if gmail_user and gmail_password:
-        try:
-            msg = MIMEText(f"Your login code: {code}")
-            msg['Subject'] = "Your Login Code"
-            msg['From'] = gmail_user
-            msg['To'] = email
-            server = smtplib.SMTP_SSL("smtp.gmail.com", 465)
-            server.login(gmail_user, gmail_password)
-            server.send_message(msg)
-            server.quit()
-        except Exception as e:
-            print(f"Email failed (check logs): {e}", file=sys.stderr)
-            
-    return {"message": "OTP generated", "debug_code": code}
-
-@app.post("/auth/verify-otp")
-def verify_otp(email: str, code: str, db: Session = Depends(get_db)):
-    otp_record = db.query(OTP).filter(OTP.email == email, OTP.code == code).order_by(OTP.id.desc()).first()
-    if not otp_record:
-        raise HTTPException(status_code=400, detail="Invalid code")
-    
-    user = db.query(User).filter(User.email == email).first()
-    if not user:
-        user = User(email=email)
-        db.add(user)
-        db.commit()
-        db.refresh(user)
-    
-    token = jwt.encode({"user_id": user.id, "email": user.email}, JWT_SECRET, algorithm="HS256")
-    return {"token": token, "user": {"email": user.email, "plan": user.plan}}
+    return {"token": token, "user": {"email": user.email, "plan": user.plan, "name": name}}
 
 @app.post("/users/activate-invite")
 def activate_invite(token: str, code: str, db: Session = Depends(get_db)):
