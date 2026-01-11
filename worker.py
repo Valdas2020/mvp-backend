@@ -1,6 +1,7 @@
 import os
 import time
 import sys
+import gc
 import boto3
 import pdfplumber
 import requests
@@ -85,57 +86,89 @@ def process_job(db: Session, job: Job):
         db.commit()
         return
 
-    translated_content = []
     total_words = 0
+    # Используем word_count как чекпойнт (номер последней обработанной страницы)
+    last_page = job.word_count or 0
     
     try:
-        with pdfplumber.open(local_filename) as pdf:
-            total_pages = len(pdf.pages)
-            print(f"Total pages: {total_pages}", file=sys.stderr)
+        # ОТКРЫВАЕМ ФАЙЛ ДЛЯ ЗАПИСИ (append mode, если возобновляем)
+        mode = "a" if last_page > 0 else "w"
+        with open(output_filename, mode, encoding="utf-8") as out_file:
             
-            for i, page in enumerate(pdf.pages):
-                text = page.extract_text()
-                if text:
-                    words = len(text.split())
-                    total_words += words
+            # Переоткрываем PDF батчами по 20 страниц для освобождения памяти
+            with pdfplumber.open(local_filename) as pdf:
+                total_pages = len(pdf.pages)
+                print(f"Total pages: {total_pages} (resuming from page {last_page + 1})", file=sys.stderr)
+            
+            # Обрабатываем батчами по 20 страниц
+            for batch_start in range(last_page, total_pages, 20):
+                with pdfplumber.open(local_filename) as pdf:
+                    batch_end = min(batch_start + 20, total_pages)
                     
-                    print(f"Translating page {i+1}/{total_pages}...", file=sys.stderr)
-                    trans = translate_text(text)
-                    translated_content.append(f"--- Page {i+1} ---\n{trans}\n\n")
+                    for i in range(batch_start, batch_end):
+                        page = pdf.pages[i]
+                        text = page.extract_text()
+                        
+                        if text:
+                            words = len(text.split())
+                            total_words += words
+                            
+                            print(f"Translating page {i+1}/{total_pages}...", file=sys.stderr)
+                            trans = translate_text(text)
+                            
+                            # ПИШЕМ СРАЗУ В ФАЙЛ (не в список!)
+                            out_file.write(f"--- Page {i+1} ---\n{trans}\n\n")
+                            out_file.flush()  # принудительно сбрасываем буфер
+                        
+                        # ЧЕКПОЙНТ каждые 5 страниц
+                        if (i + 1) % 5 == 0:
+                            job.word_count = i + 1  # сохраняем номер последней обработанной страницы
+                            db.commit()
                 
-                if i % 5 == 0:
-                    job.word_count = total_words
-                    db.commit()
-
-        with open(output_filename, "w", encoding="utf-8") as f:
-            f.write("".join(translated_content))
-            
+                # ОСВОБОЖДАЕМ ПАМЯТЬ после каждого батча
+                gc.collect()
+                print(f"🧹 Memory cleanup after batch ending at page {batch_end}", file=sys.stderr)
+        
+        # ЗАГРУЖАЕМ РЕЗУЛЬТАТ В R2
         r2_key_output = f"outputs/{job.user_id}/translated_{job.filename}.txt"
         s3.upload_file(output_filename, R2_BUCKET, r2_key_output)
         
         job.status = "completed"
         job.r2_key_output = r2_key_output
-        job.word_count = total_words
+        job.word_count = total_pages  # финальное значение = общее количество страниц
         db.commit()
-        print(f"Job {job.id} COMPLETED!", file=sys.stderr)
+        print(f"✅ Job {job.id} COMPLETED! Total pages: {total_pages}", file=sys.stderr)
         
     except Exception as e:
-        print(f"Processing failed: {e}", file=sys.stderr)
+        print(f"❌ Processing failed: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc(file=sys.stderr)
         job.status = "failed"
         db.commit()
     finally:
+        # Удаляем временные файлы
         if os.path.exists(local_filename):
-            os.remove(local_filename)
-        if os.path.exists(output_filename):
-             try: os.remove(output_filename)
-             except: pass
+            try:
+                os.remove(local_filename)
+                print(f"🗑️ Removed temp input: {local_filename}", file=sys.stderr)
+            except Exception as e:
+                print(f"⚠️ Failed to remove {local_filename}: {e}", file=sys.stderr)
+        
+        # Удаляем output только если job завершён или провалился
+        if job.status in ["completed", "failed"] and os.path.exists(output_filename):
+            try:
+                os.remove(output_filename)
+                print(f"🗑️ Removed temp output: {output_filename}", file=sys.stderr)
+            except Exception as e:
+                print(f"⚠️ Failed to remove {output_filename}: {e}", file=sys.stderr)
 
 def run_worker():
     print(f"Worker started with model {MODEL}... Waiting for jobs.", file=sys.stderr)
     while True:
         db = SessionLocal()
         try:
-            job = db.query(Job).filter(Job.status == "queued").first()
+            # Берём самую старую задачу в очереди (FIFO)
+            job = db.query(Job).filter(Job.status == "queued").order_by(Job.created_at.asc()).first()
             if job:
                 job.status = "processing"
                 db.commit()
@@ -144,9 +177,16 @@ def run_worker():
                 time.sleep(5)
         except Exception as e:
             print(f"Worker loop error: {e}", file=sys.stderr)
+            import traceback
+            traceback.print_exc(file=sys.stderr)
             time.sleep(5)
         finally:
             db.close()
 
 if __name__ == "__main__":
+    print("=" * 60, file=sys.stderr)
+    print("🚀 PDF Translation Worker Starting", file=sys.stderr)
+    print(f"📦 Model: {MODEL}", file=sys.stderr)
+    print(f"🪣 R2 Bucket: {R2_BUCKET}", file=sys.stderr)
+    print("=" * 60, file=sys.stderr)
     run_worker()
