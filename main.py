@@ -76,6 +76,13 @@ def alpha_login(invite_code: str = Form(...), name: str = Form(...), email: str 
     # Логируем входящий код для диагностики
     print(f"[ALPHA LOGIN] invite_code raw: '{invite_code}'", flush=True)
     
+    # Диагностика БД
+    db_name = db.execute(text("SELECT current_database()")).scalar()
+    print(f"[DB CHECK] current_database = {db_name}", flush=True)
+    
+    cnt = db.execute(text("SELECT COUNT(*) FROM invite_codes")).scalar()
+    print(f"[DB CHECK] invite_codes count = {cnt}", flush=True)
+    
     # 1. Проверяем инвайт (с trim пробелов)
     invite = db.query(InviteCode).filter(
         InviteCode.code == invite_code.strip()
@@ -109,6 +116,7 @@ def alpha_login(invite_code: str = Form(...), name: str = Form(...), email: str 
     }, JWT_SECRET, algorithm="HS256")
     
     return {"token": token, "user": {"email": user.email, "plan": user.plan, "name": name}}
+  
     
 @app.post("/users/activate-invite")
 def activate_invite(token: str, code: str, db: Session = Depends(get_db)):
