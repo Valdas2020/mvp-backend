@@ -180,28 +180,48 @@ def activate_invite(token: str, code: str, db: Session = Depends(get_db)):
 
 @app.post("/jobs/upload")
 async def upload_file(token: str, file: UploadFile = File(...), db: Session = Depends(get_db)):
+    print(f"[UPLOAD] Start uploading file: {file.filename}", file=sys.stderr)
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
         user_id = payload["user_id"]
-    except Exception:
+        print(f"[UPLOAD] User ID: {user_id}", file=sys.stderr)
+    except Exception as e:
+        print(f"[UPLOAD] JWT Error: {e}", file=sys.stderr)
         raise HTTPException(status_code=401, detail="Invalid token")
 
-    file_content = await file.read()
-    filename = f"{uuid.uuid4()}_{file.filename}"
-    r2_key = f"uploads/{user_id}/{filename}"
+    try:
+        file_content = await file.read()
+        filename = f"{uuid.uuid4()}_{file.filename}"
+        r2_key = f"uploads/{user_id}/{filename}"
 
-    s3.put_object(Bucket=BUCKET, Key=r2_key, Body=file_content)
+        print(f"[UPLOAD] Attempting R2 upload to key: {r2_key}", file=sys.stderr)
+        
+        s3.put_object(
+            Bucket=BUCKET, 
+            Key=r2_key, 
+            Body=file_content,
+            ContentType=file.content_type
+        )
+        print(f"[UPLOAD] R2 Upload Successful", file=sys.stderr)
 
-    job = Job(
-        user_id=user_id,
-        filename=file.filename,
-        r2_key_input=r2_key,
-        status="queued",
-    )
-    db.add(job)
-    db.commit()
+        job = Job(
+            user_id=user_id,
+            filename=file.filename,
+            r2_key_input=r2_key,
+            status="queued",
+        )
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+        
+        print(f"[UPLOAD] Job created in DB with ID: {job.id}", file=sys.stderr)
+        return {"job_id": job.id, "status": "queued"}
 
-    return {"job_id": job.id, "status": "queued"}
+    except Exception as e:
+        print(f"[UPLOAD] CRITICAL ERROR: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/jobs")
