@@ -73,12 +73,13 @@ JWT_SECRET = os.getenv("JWT_SECRET", "secret_key_change_me")
 
 @app.post("/auth/alpha-login")
 def alpha_login(invite_code: str = Form(...), name: str = Form(...), email: str = Form(...), db: Session = Depends(get_db)):
-    # 1. Проверяем инвайт
+    # Логируем входящий код для диагностики
     print(f"[ALPHA LOGIN] invite_code raw: '{invite_code}'", flush=True)
-
-invite = db.query(InviteCode).filter(
-    InviteCode.code == invite_code.strip()
-).first()
+    
+    # 1. Проверяем инвайт (с trim пробелов)
+    invite = db.query(InviteCode).filter(
+        InviteCode.code == invite_code.strip()
+    ).first()
     
     if not invite:
         raise HTTPException(status_code=400, detail="Неверный код приглашения")
@@ -87,8 +88,6 @@ invite = db.query(InviteCode).filter(
         raise HTTPException(status_code=400, detail="Код полностью использован")
     
     # 2. Создаем "одноразового" пользователя
-    # Мы используем email + время, чтобы не было конфликтов, если один человек зайдет дважды
-    unique_email = f"{email}_{int(time.time())}" 
     user = User(
         email=email, 
         plan=invite.tier, 
@@ -106,11 +105,11 @@ invite = db.query(InviteCode).filter(
         "user_id": user.id, 
         "email": user.email,
         "name": name,
-        "exp": datetime.utcnow() + timedelta(days=1) # Сессия на 24 часа
+        "exp": datetime.utcnow() + timedelta(days=1)
     }, JWT_SECRET, algorithm="HS256")
     
     return {"token": token, "user": {"email": user.email, "plan": user.plan, "name": name}}
-
+    
 @app.post("/users/activate-invite")
 def activate_invite(token: str, code: str, db: Session = Depends(get_db)):
     try:
