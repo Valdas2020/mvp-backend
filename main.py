@@ -273,11 +273,15 @@ def download_job(
         raise HTTPException(status_code=404, detail="File not ready")
 
     try:
-        presigned_url = s3.generate_presigned_url(
-            "get_object",
-            Params={"Bucket": R2_BUCKET, "Key": job.r2_key_output},
-            ExpiresIn=3600,
-        )
+    presigned_url = s3.generate_presigned_url(
+    "get_object",
+    Params={
+        "Bucket": R2_BUCKET,
+        "Key": job.r2_key_output,
+        "ResponseContentDisposition": f'attachment; filename="translated_{job.filename}.txt"'
+    },
+    ExpiresIn=3600,
+)
     except Exception as e:
         print(f"[DOWNLOAD] presign failed: {e}", flush=True)
         raise HTTPException(status_code=500, detail="Failed to generate download URL")
