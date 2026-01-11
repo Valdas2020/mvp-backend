@@ -9,7 +9,7 @@ import smtplib
 from email.mime.text import MIMEText
 import jwt
 import boto3
-from botocore.client import Config # <--- ВАЖНЫЙ ИМПОРТ
+from botocore.client import Config
 import uuid
 import sys
 
@@ -29,7 +29,7 @@ s3 = boto3.client(
     endpoint_url=os.getenv("R2_ENDPOINT"),
     aws_access_key_id=os.getenv("R2_ACCESS_KEY"),
     aws_secret_access_key=os.getenv("R2_SECRET_KEY"),
-    config=Config(signature_version='s3v4'), # <--- ВКЛЮЧАЕМ SigV4
+    config=Config(signature_version='s3v4'),
     region_name='auto'
 )
 BUCKET = os.getenv("R2_BUCKET")
@@ -73,17 +73,9 @@ JWT_SECRET = os.getenv("JWT_SECRET", "secret_key_change_me")
 
 @app.post("/auth/alpha-login")
 def alpha_login(invite_code: str = Form(...), name: str = Form(...), email: str = Form(...), db: Session = Depends(get_db)):
-    # Логируем входящий код для диагностики
     print(f"[ALPHA LOGIN] invite_code raw: '{invite_code}'", flush=True)
     
-    # Диагностика БД
-    db_name = db.execute(text("SELECT current_database()")).scalar()
-    print(f"[DB CHECK] current_database = {db_name}", flush=True)
-    
-    cnt = db.execute(text("SELECT COUNT(*) FROM invite_codes")).scalar()
-    print(f"[DB CHECK] invite_codes count = {cnt}", flush=True)
-    
-    # 1. Проверяем инвайт (с trim пробелов)
+    # Проверяем инвайт (с trim пробелов)
     invite = db.query(InviteCode).filter(
         InviteCode.code == invite_code.strip()
     ).first()
@@ -94,7 +86,7 @@ def alpha_login(invite_code: str = Form(...), name: str = Form(...), email: str 
     if invite.used_count >= invite.max_uses:
         raise HTTPException(status_code=400, detail="Код полностью использован")
     
-    # 2. Создаем "одноразового" пользователя
+    # Создаем "одноразового" пользователя
     user = User(
         email=email, 
         plan=invite.tier, 
@@ -102,12 +94,12 @@ def alpha_login(invite_code: str = Form(...), name: str = Form(...), email: str 
     )
     db.add(user)
     
-    # 3. Обновляем счетчик инвайта
+    # Обновляем счетчик инвайта
     invite.used_count += 1
     db.commit()
     db.refresh(user)
     
-    # 4. Генерируем токен для сессии
+    # Генерируем токен для сессии
     token = jwt.encode({
         "user_id": user.id, 
         "email": user.email,
