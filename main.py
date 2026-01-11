@@ -260,9 +260,13 @@ def download_job(
     token: str = Query(...),
     db: Session = Depends(get_db),
 ):
-    _user_id = decode_user_id(token)  # MVP: пока просто проверка токена
+    _user_id = decode_user_id(token)
 
-    job = db.query(Job).filter(Job.id == job_id).first()
+    job = (
+        db.query(Job)
+        .filter(Job.id == job_id, Job.user_id == _user_id)
+        .first()
+    )
     if not job or not job.r2_key_output:
         raise HTTPException(status_code=404, detail="File not ready")
 
