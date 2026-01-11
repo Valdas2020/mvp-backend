@@ -254,6 +254,8 @@ async def upload_file(
     return {"job_id": job.id, "status": job.status}
 
 
+from fastapi.responses import RedirectResponse
+
 @app.get("/jobs/{job_id}/download")
 def download_job(
     job_id: int,
@@ -271,7 +273,7 @@ def download_job(
         raise HTTPException(status_code=404, detail="File not ready")
 
     try:
-        url = s3.generate_presigned_url(
+        presigned_url = s3.generate_presigned_url(
             "get_object",
             Params={"Bucket": R2_BUCKET, "Key": job.r2_key_output},
             ExpiresIn=3600,
@@ -280,4 +282,5 @@ def download_job(
         print(f"[DOWNLOAD] presign failed: {e}", flush=True)
         raise HTTPException(status_code=500, detail="Failed to generate download URL")
 
-    return {"url": url}
+    # 🔥 ВАЖНО: redirect, а не JSON
+    return RedirectResponse(url=presigned_url, status_code=302)
