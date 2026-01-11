@@ -177,52 +177,49 @@ def activate_invite(token: str, code: str, db: Session = Depends(get_db)):
     db.commit()
     return {"plan": user.plan, "quota": user.quota_words}
 
+from fastapi import Header
 
 @app.post("/jobs/upload")
-async def upload_file(token: str, file: UploadFile = File(...), db: Session = Depends(get_db)):
-    print(f"[UPLOAD] Start uploading file: {file.filename}", file=sys.stderr)
+async def upload_file(
+    authorization: str = Header(...),
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
     try:
+        if not authorization.startswith("Bearer "):
+            raise HTTPException(status_code=401, detail="Invalid auth header")
+
+        token = authorization.replace("Bearer ", "")
         payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
         user_id = payload["user_id"]
-        print(f"[UPLOAD] User ID: {user_id}", file=sys.stderr)
+
     except Exception as e:
-        print(f"[UPLOAD] JWT Error: {e}", file=sys.stderr)
         raise HTTPException(status_code=401, detail="Invalid token")
 
-    try:
-        file_content = await file.read()
-        filename = f"{uuid.uuid4()}_{file.filename}"
-        r2_key = f"uploads/{user_id}/{filename}"
+    file_content = await file.read()
+    filename = f"{uuid.uuid4()}_{file.filename}"
+    r2_key = f"uploads/{user_id}/{filename}"
 
-        print(f"[UPLOAD] Attempting R2 upload to key: {r2_key}", file=sys.stderr)
-        
-        s3.put_object(
-            Bucket=BUCKET, 
-            Key=r2_key, 
-            Body=file_content,
-            ContentType=file.content_type
-        )
-        print(f"[UPLOAD] R2 Upload Successful", file=sys.stderr)
+    s3.put_object(
+        Bucket=BUCKET,
+        Key=r2_key,
+        Body=file_content,
+        ContentType=file.content_type,
+    )
 
-        job = Job(
-            user_id=user_id,
-            filename=file.filename,
-            r2_key_input=r2_key,
-            status="queued",
-        )
-        db.add(job)
-        db.commit()
-        db.refresh(job)
-        
-        print(f"[UPLOAD] Job created in DB with ID: {job.id}", file=sys.stderr)
-        return {"job_id": job.id, "status": "queued"}
+    job = Job(
+        user_id=user_id,
+        filename=file.filename,
+        r2_key_input=r2_key,
+        status="queued",
+    )
+    db.add(job)
+    db.commit()
+    db.refresh(job)
 
-    except Exception as e:
-        print(f"[UPLOAD] CRITICAL ERROR: {e}", file=sys.stderr)
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+    return {"job_id": job.id, "status": "queued"}
 
+ 
 
 @app.get("/jobs")
 def list_jobs(token: str, db: Session = Depends(get_db)):
