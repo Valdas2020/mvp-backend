@@ -1,9 +1,10 @@
 fastapi
 uvicorn
-sqlalchemy==2.0.36
+sqlalchemy
 psycopg2-binary
+pydantic
+python-jose[cryptography]
 python-multipart
-passlib[bcrypt]
 boto3
 pdfplumber
 requests
