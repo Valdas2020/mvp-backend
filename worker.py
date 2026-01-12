@@ -55,7 +55,7 @@ MODEL = os.getenv("MODEL", "gpt-4o-mini")
 
 POLL_SECONDS = int(os.getenv("WORKER_POLL_SECONDS", "5"))
 PDF_BATCH_SIZE = int(os.getenv("PDF_BATCH_SIZE", "20"))
-CHECKPOINT_EVERY_PAGES = int(os.getenv("CHECKPOINT_EVERY_PAGES", "5"))
+CHECKPOINT_EVERY_PAGES = 1  # Будет обновлять статус в базе после каждой страницы
 
 LLM_TIMEOUT_SECONDS = int(os.getenv("LLM_TIMEOUT_SECONDS", "90"))
 LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "3"))
