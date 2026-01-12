@@ -27,10 +27,13 @@ R2_SECRET_KEY = os.getenv("R2_SECRET_KEY")
 
 app = FastAPI()
 
-# CORS
+# CORS — ИСПРАВЛЕНО
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "https://mvp-frontend-6pj9.onrender.com",
+        "http://localhost:3000",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -103,6 +106,9 @@ class OTPVerifyRequest(BaseModel):
 class InviteActivateRequest(BaseModel):
     invite_code: str
 
+class InviteLoginRequest(BaseModel):
+    invite_code: str
+
 class UploadRequest(BaseModel):
     filename: str
 
@@ -110,77 +116,50 @@ class UploadRequest(BaseModel):
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "mvp-backend", "version": "1.0"}
+    return {"status": "ok", "service": "mvp-backend", "version": "1.1"}
 
-@app.post("/api/auth/request-otp")
-def request_otp(req: EmailRequest, db: Session = Depends(get_db)):
-    """Шаг 1: Запрос OTP на email"""
-    email = req.email.lower().strip()
-    
-    print(f"[OTP] Request for {email}", flush=True)
-    
-    # Создаём или находим пользователя
-    user = db.query(User).filter(User.email == email).first()
-    if not user:
-        user = User(email=email, name=email.split("@")[0])
-        db.add(user)
-        db.commit()
-        db.refresh(user)
-        print(f"[OTP] New user created: {user.id}", flush=True)
-    
-    # Генерируем OTP
-    otp_code = generate_otp()
-    otp_entry = OTP(user_id=user.id, code=otp_code)
-    db.add(otp_entry)
-    db.commit()
-    
-    print(f"[OTP] Generated code for user {user.id}: {otp_code}", flush=True)
-    
-    # Отправляем email
-    send_email(
-        email,
-        "Your OTP Code",
-        f"Your verification code is: {otp_code}\n\nValid for 10 minutes."
-    )
-    
-    return {"message": "OTP sent"}
+# ========================================
+# INVITE-ONLY AUTH (основной для MVP)
+# ========================================
 
-@app.post("/api/auth/verify-otp")
-def verify_otp(req: OTPVerifyRequest, db: Session = Depends(get_db)):
-    """Шаг 2: Проверка OTP и выдача JWT"""
-    email = req.email.lower().strip()
-    user = db.query(User).filter(User.email == email).first()
+@app.post("/api/auth/invite-login")
+def invite_login(req: InviteLoginRequest, db: Session = Depends(get_db)):
+    """Логин по инвайт-коду (без email)"""
+    print(f"[INVITE-LOGIN] Attempt with code: {req.invite_code}", flush=True)
     
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-    
-    print(f"[OTP] Verifying for user {user.id}, code: {req.otp}", flush=True)
-    
-    # Проверяем OTP
-    otp_entry = (
-        db.query(OTP)
+    invite = (
+        db.query(InviteCode)
         .filter(
-            OTP.user_id == user.id,
-            OTP.code == req.otp,
-            OTP.used == False,
-            OTP.created_at > datetime.utcnow() - timedelta(minutes=10)
+            InviteCode.code == req.invite_code,
+            InviteCode.used_count < InviteCode.max_uses
         )
         .first()
     )
-    
-    if not otp_entry:
-        print(f"[OTP] Invalid or expired OTP for user {user.id}", flush=True)
-        raise HTTPException(status_code=401, detail="Invalid or expired OTP")
-    
-    # Помечаем OTP как использованный
-    otp_entry.used = True
-    db.commit()
-    
-    # Создаём JWT
+
+    if not invite:
+        print(f"[INVITE-LOGIN] Invalid or exhausted code: {req.invite_code}", flush=True)
+        raise HTTPException(status_code=401, detail="Invalid or exhausted invite code")
+
+    # Создаём или берём технического пользователя для этого инвайта
+    user_email = f"invite_{invite.code}@local"
+    user = db.query(User).filter(User.email == user_email).first()
+
+    if not user:
+        user = User(
+            email=user_email,
+            name=f"User-{invite.tier}",
+            tier=invite.tier,
+        )
+        db.add(user)
+        invite.used_count += 1
+        db.commit()
+        db.refresh(user)
+        print(f"[INVITE-LOGIN] New user created: {user.id}, tier: {user.tier}", flush=True)
+    else:
+        print(f"[INVITE-LOGIN] Existing user: {user.id}, tier: {user.tier}", flush=True)
+
     token = create_jwt(user.id, user.email, user.name)
-    
-    print(f"[OTP] Success! Token issued for user {user.id}", flush=True)
-    
+
     return {
         "token": token,
         "user": {
@@ -191,13 +170,61 @@ def verify_otp(req: OTPVerifyRequest, db: Session = Depends(get_db)):
         }
     }
 
+# ========================================
+# OTP AUTH (отключено для MVP, но код оставлен)
+# ========================================
+
+@app.post("/api/auth/request-otp")
+def request_otp(req: EmailRequest, db: Session = Depends(get_db)):
+    """Шаг 1: Запрос OTP на email (ВРЕМЕННО ОТКЛЮЧЕНО)"""
+    raise HTTPException(status_code=503, detail="OTP auth temporarily disabled. Use invite code.")
+    
+    # Код ниже закомментирован, но оставлен для будущего
+    """
+    email = req.email.lower().strip()
+    
+    print(f"[OTP] Request for {email}", flush=True)
+    
+    user = db.query(User).filter(User.email == email).first()
+    if not user:
+        user = User(email=email, name=email.split("@")[0])
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+        print(f"[OTP] New user created: {user.id}", flush=True)
+    
+    otp_code = generate_otp()
+    otp_entry = OTP(user_id=user.id, code=otp_code)
+    db.add(otp_entry)
+    db.commit()
+    
+    print(f"[OTP] Generated code for user {user.id}: {otp_code}", flush=True)
+    
+    send_email(
+        email,
+        "Your OTP Code",
+        f"Your verification code is: {otp_code}\n\nValid for 10 minutes."
+    )
+    
+    return {"message": "OTP sent"}
+    """
+
+@app.post("/api/auth/verify-otp")
+def verify_otp(req: OTPVerifyRequest, db: Session = Depends(get_db)):
+    """Шаг 2: Проверка OTP и выдача JWT (ВРЕМЕННО ОТКЛЮЧЕНО)"""
+    raise HTTPException(status_code=503, detail="OTP auth temporarily disabled. Use invite code.")
+
+# ========================================
+# INVITE ACTIVATION (для будущего расширения)
+# ========================================
+
 @app.post("/api/invite/activate")
 def activate_invite(
     req: InviteActivateRequest,
     token: str = Query(...),
     db: Session = Depends(get_db)
 ):
-    """Активация инвайт-кода"""
+    """Активация инвайт-кода для существующего пользователя"""
     user_id = decode_user_id(token)
     user = db.query(User).filter(User.id == user_id).first()
     
@@ -222,7 +249,6 @@ def activate_invite(
         print(f"[INVITE] Invalid or exhausted code: {req.invite_code}", flush=True)
         raise HTTPException(status_code=404, detail="Invalid or exhausted invite code")
     
-    # Активируем тир
     user.tier = invite.tier
     invite.used_count += 1
     db.commit()
@@ -230,6 +256,10 @@ def activate_invite(
     print(f"[INVITE] User {user_id} activated tier {invite.tier}", flush=True)
     
     return {"message": f"Tier {invite.tier} activated", "tier": invite.tier}
+
+# ========================================
+# FILE OPERATIONS
+# ========================================
 
 @app.post("/api/upload")
 async def upload_file(
@@ -245,9 +275,9 @@ async def upload_file(
         raise HTTPException(status_code=404, detail="User not found")
     
     if not user.tier:
-        raise HTTPException(status_code=403, detail="No active tier")
+        raise HTTPException(status_code=403, detail="No active tier. Please use invite code.")
     
-    print(f"[UPLOAD] User {user_id} uploading: {file.filename}", flush=True)
+    print(f"[UPLOAD] User {user_id} (tier {user.tier}) uploading: {file.filename}", flush=True)
     
     # Проверка лимитов (упрощённо)
     # TODO: добавить проверку месячного лимита слов
