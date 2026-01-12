@@ -66,7 +66,7 @@ def send_email(to_email: str, subject: str, body: str):
             server.send_message(msg)
         return True
     except Exception as e:
-        print(f"Email send failed: {e}")
+        print(f"Email send failed: {e}", flush=True)
         return False
 
 def generate_otp():
@@ -88,7 +88,8 @@ def decode_user_id(token: str):
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
         return payload["user_id"]
-    except:
+    except Exception as e:
+        print(f"JWT decode error: {e}", flush=True)
         raise HTTPException(status_code=401, detail="Invalid token")
 
 # --- PYDANTIC MODELS ---
@@ -109,12 +110,14 @@ class UploadRequest(BaseModel):
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "mvp-backend"}
+    return {"status": "ok", "service": "mvp-backend", "version": "1.0"}
 
-@app.post("/auth/request-otp")
+@app.post("/api/auth/request-otp")
 def request_otp(req: EmailRequest, db: Session = Depends(get_db)):
     """Шаг 1: Запрос OTP на email"""
     email = req.email.lower().strip()
+    
+    print(f"[OTP] Request for {email}", flush=True)
     
     # Создаём или находим пользователя
     user = db.query(User).filter(User.email == email).first()
@@ -123,12 +126,15 @@ def request_otp(req: EmailRequest, db: Session = Depends(get_db)):
         db.add(user)
         db.commit()
         db.refresh(user)
+        print(f"[OTP] New user created: {user.id}", flush=True)
     
     # Генерируем OTP
     otp_code = generate_otp()
     otp_entry = OTP(user_id=user.id, code=otp_code)
     db.add(otp_entry)
     db.commit()
+    
+    print(f"[OTP] Generated code for user {user.id}: {otp_code}", flush=True)
     
     # Отправляем email
     send_email(
@@ -139,7 +145,7 @@ def request_otp(req: EmailRequest, db: Session = Depends(get_db)):
     
     return {"message": "OTP sent"}
 
-@app.post("/auth/verify-otp")
+@app.post("/api/auth/verify-otp")
 def verify_otp(req: OTPVerifyRequest, db: Session = Depends(get_db)):
     """Шаг 2: Проверка OTP и выдача JWT"""
     email = req.email.lower().strip()
@@ -147,6 +153,8 @@ def verify_otp(req: OTPVerifyRequest, db: Session = Depends(get_db)):
     
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+    
+    print(f"[OTP] Verifying for user {user.id}, code: {req.otp}", flush=True)
     
     # Проверяем OTP
     otp_entry = (
@@ -161,6 +169,7 @@ def verify_otp(req: OTPVerifyRequest, db: Session = Depends(get_db)):
     )
     
     if not otp_entry:
+        print(f"[OTP] Invalid or expired OTP for user {user.id}", flush=True)
         raise HTTPException(status_code=401, detail="Invalid or expired OTP")
     
     # Помечаем OTP как использованный
@@ -169,6 +178,8 @@ def verify_otp(req: OTPVerifyRequest, db: Session = Depends(get_db)):
     
     # Создаём JWT
     token = create_jwt(user.id, user.email, user.name)
+    
+    print(f"[OTP] Success! Token issued for user {user.id}", flush=True)
     
     return {
         "token": token,
@@ -180,7 +191,7 @@ def verify_otp(req: OTPVerifyRequest, db: Session = Depends(get_db)):
         }
     }
 
-@app.post("/invite/activate")
+@app.post("/api/invite/activate")
 def activate_invite(
     req: InviteActivateRequest,
     token: str = Query(...),
@@ -190,8 +201,13 @@ def activate_invite(
     user_id = decode_user_id(token)
     user = db.query(User).filter(User.id == user_id).first()
     
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
     if user.tier:
         raise HTTPException(status_code=400, detail="Already activated")
+    
+    print(f"[INVITE] User {user_id} trying code: {req.invite_code}", flush=True)
     
     invite = (
         db.query(InviteCode)
@@ -203,6 +219,7 @@ def activate_invite(
     )
     
     if not invite:
+        print(f"[INVITE] Invalid or exhausted code: {req.invite_code}", flush=True)
         raise HTTPException(status_code=404, detail="Invalid or exhausted invite code")
     
     # Активируем тир
@@ -210,9 +227,11 @@ def activate_invite(
     invite.used_count += 1
     db.commit()
     
+    print(f"[INVITE] User {user_id} activated tier {invite.tier}", flush=True)
+    
     return {"message": f"Tier {invite.tier} activated", "tier": invite.tier}
 
-@app.post("/upload")
+@app.post("/api/upload")
 async def upload_file(
     file: UploadFile = File(...),
     token: str = Query(...),
@@ -222,19 +241,26 @@ async def upload_file(
     user_id = decode_user_id(token)
     user = db.query(User).filter(User.id == user_id).first()
     
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
     if not user.tier:
         raise HTTPException(status_code=403, detail="No active tier")
+    
+    print(f"[UPLOAD] User {user_id} uploading: {file.filename}", flush=True)
     
     # Проверка лимитов (упрощённо)
     # TODO: добавить проверку месячного лимита слов
     
     # Сохраняем в R2
-    r2_key = f"inputs/{user_id}/{file.filename}"
+    r2_key = f"inputs/{user_id}/{int(time.time())}_{file.filename}"
     content = await file.read()
     
     try:
         s3.put_object(Bucket=R2_BUCKET, Key=r2_key, Body=content)
+        print(f"[UPLOAD] Saved to R2: {r2_key}", flush=True)
     except Exception as e:
+        print(f"[UPLOAD] R2 upload failed: {e}", flush=True)
         raise HTTPException(status_code=500, detail=f"Upload failed: {e}")
     
     # Создаём задачу
@@ -248,9 +274,11 @@ async def upload_file(
     db.commit()
     db.refresh(job)
     
+    print(f"[UPLOAD] Job {job.id} created", flush=True)
+    
     return {"job_id": job.id, "status": "queued"}
 
-@app.get("/jobs")
+@app.get("/api/jobs")
 def list_jobs(token: str = Query(...), db: Session = Depends(get_db)):
     """Список задач пользователя"""
     user_id = decode_user_id(token)
@@ -260,6 +288,8 @@ def list_jobs(token: str = Query(...), db: Session = Depends(get_db)):
         .order_by(Job.created_at.desc())
         .all()
     )
+    
+    print(f"[JOBS] User {user_id} has {len(jobs)} jobs", flush=True)
     
     return {
         "jobs": [
@@ -274,7 +304,7 @@ def list_jobs(token: str = Query(...), db: Session = Depends(get_db)):
         ]
     }
 
-@app.get("/jobs/{job_id}/download")
+@app.get("/api/jobs/{job_id}/download")
 def download_job(
     job_id: int,
     token: str = Query(...),
@@ -293,10 +323,14 @@ def download_job(
     )
     
     if not job:
+        print(f"[DOWNLOAD] Job {job_id} not found for user {user_id}", flush=True)
         raise HTTPException(status_code=404, detail="Job not found")
     
     if not job.r2_key_output:
+        print(f"[DOWNLOAD] Job {job_id} not ready yet", flush=True)
         raise HTTPException(status_code=404, detail="File not ready")
+
+    print(f"[DOWNLOAD] User {user_id} downloading job {job_id}", flush=True)
 
     try:
         # Генерируем presigned URL с форсированным скачиванием
@@ -313,11 +347,7 @@ def download_job(
         print(f"[DOWNLOAD] presign failed: {e}", flush=True)
         raise HTTPException(status_code=500, detail="Failed to generate download URL")
 
-    # Вариант 1: Redirect (быстрый, но может открыть в браузере)
-    # from fastapi.responses import RedirectResponse
-    # return RedirectResponse(url=presigned_url, status_code=302)
-    
-    # Вариант 2: Proxy через backend (гарантированное скачивание)
+    # Proxy через backend (гарантированное скачивание)
     try:
         r = requests.get(presigned_url, stream=True, timeout=30)
         r.raise_for_status()
@@ -333,7 +363,7 @@ def download_job(
         print(f"[DOWNLOAD] streaming failed: {e}", flush=True)
         raise HTTPException(status_code=500, detail="Download failed")
 
-@app.get("/user/info")
+@app.get("/api/user/info")
 def user_info(token: str = Query(...), db: Session = Depends(get_db)):
     """Информация о пользователе"""
     user_id = decode_user_id(token)
