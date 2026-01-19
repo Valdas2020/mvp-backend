@@ -20,15 +20,16 @@ from models import SessionLocal, User, InviteCode, OTP, Job, Usage  # noqa: F401
 # ----------------------------
 # CONFIG
 # ----------------------------
-JWT_SECRET = os.getenv("JWT_SECRET", "change-me")
+JWT_SECRET = os.getenv("JWT_SECRET")
+ADMIN_SECRET = os.getenv("ADMIN_SECRET", "admin-change-me")
 R2_BUCKET = os.getenv("R2_BUCKET")
 R2_ENDPOINT = os.getenv("R2_ENDPOINT")
 R2_ACCESS_KEY = os.getenv("R2_ACCESS_KEY")
 R2_SECRET_KEY = os.getenv("R2_SECRET_KEY")
 
 # Basic sanity (helps catch misconfigured env early)
-if not JWT_SECRET:
-    raise RuntimeError("JWT_SECRET is missing")
+if not JWT_SECRET or JWT_SECRET == "change-me":
+    raise RuntimeError("JWT_SECRET must be set to a secure random value")
 if not R2_BUCKET:
     raise RuntimeError("R2_BUCKET is missing")
 if not R2_ENDPOINT:
@@ -134,7 +135,7 @@ def root():
 # ========================================
 @app.post("/api/auth/invite-login")
 def invite_login(req: InviteLoginRequest, db: Session = Depends(get_db)):
-    code = (req.invite_code or "").strip()
+    code = (req.invite_code or "").strip().upper()  # Приводим к верхнему регистру
     if not code:
         raise HTTPException(status_code=400, detail="invite_code required")
 
@@ -370,6 +371,71 @@ def user_info(token: str = Query(...), db: Session = Depends(get_db)):
         "email": user.email,
         "name": getattr(user, "name", "") if hasattr(user, "name") else "",
         "tier": getattr(user, "tier", None) if hasattr(user, "tier") else None,
+    }
+
+
+# ========================================
+# ADMIN PANEL
+# ========================================
+@app.get("/api/admin/codes")
+def admin_list_codes(admin_secret: str = Query(...), db: Session = Depends(get_db)):
+    """Список всех инвайт-кодов с их статусом"""
+    if admin_secret != ADMIN_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid admin secret")
+
+    codes = db.query(InviteCode).order_by(InviteCode.tier.desc(), InviteCode.code).all()
+
+    return {
+        "total": len(codes),
+        "codes": [
+            {
+                "code": c.code,
+                "tier": c.tier,
+                "quota_words": c.quota_words,
+                "max_uses": c.max_uses,
+                "used_count": c.used_count,
+                "available": c.max_uses - c.used_count > 0,
+            }
+            for c in codes
+        ],
+        "stats": {
+            "tier_M_total": sum(1 for c in codes if c.tier == "M"),
+            "tier_M_used": sum(1 for c in codes if c.tier == "M" and c.used_count > 0),
+            "tier_S_total": sum(1 for c in codes if c.tier == "S"),
+            "tier_S_used": sum(1 for c in codes if c.tier == "S" and c.used_count > 0),
+        }
+    }
+
+
+@app.get("/api/admin/stats")
+def admin_stats(admin_secret: str = Query(...), db: Session = Depends(get_db)):
+    """Общая статистика по пользователям и заданиям"""
+    if admin_secret != ADMIN_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid admin secret")
+
+    total_users = db.query(User).count()
+    total_jobs = db.query(Job).count()
+    jobs_queued = db.query(Job).filter(Job.status == "queued").count()
+    jobs_processing = db.query(Job).filter(Job.status == "processing").count()
+    jobs_completed = db.query(Job).filter(Job.status == "completed").count()
+    jobs_failed = db.query(Job).filter(Job.status == "failed").count()
+
+    total_words = db.query(Job).filter(Job.status == "completed").with_entities(
+        db.func.sum(Job.word_count)
+    ).scalar() or 0
+
+    return {
+        "users": {
+            "total": total_users,
+        },
+        "jobs": {
+            "total": total_jobs,
+            "queued": jobs_queued,
+            "processing": jobs_processing,
+            "completed": jobs_completed,
+            "failed": jobs_failed,
+        },
+        "words_translated": total_words,
     }
 
 
