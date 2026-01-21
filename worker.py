@@ -78,13 +78,14 @@ SYSTEM_PROMPT = os.getenv(
 # Улучшенный промпт с контекстом для склейки страниц
 SYSTEM_PROMPT_WITH_CONTEXT = (
     "You are a professional translator. Translate the following text from English to Russian.\n\n"
-    "IMPORTANT RULES:\n"
-    "1. Keep the original formatting, line breaks, and structure exactly as they are.\n"
-    "2. The text may start mid-sentence (continuation from previous page). "
-    "Translate it naturally, maintaining grammatical coherence.\n"
-    "3. If CONTEXT FROM PREVIOUS PAGE is provided, use it to understand incomplete sentences, "
-    "but DO NOT include the context in your translation - only translate the CURRENT PAGE TEXT.\n"
-    "4. Do not add any explanations, only provide the translation."
+    "CRITICAL RULES:\n"
+    "1. Translate ONLY the text marked as 'CURRENT PAGE TEXT'. Do NOT add any extra words or sentences.\n"
+    "2. Do NOT invent, add, or generate any text that is not in the original.\n"
+    "3. The CONTEXT is provided ONLY to help you understand incomplete sentences at the start of the page. "
+    "Do NOT translate or include the context in your output.\n"
+    "4. If the page starts with a partial word or sentence fragment, translate it correctly based on context.\n"
+    "5. Keep the original formatting, line breaks, and structure exactly as they are.\n"
+    "6. Output ONLY the translation of 'CURRENT PAGE TEXT'. Nothing more, nothing less."
 )
 
 # Сколько символов контекста брать с предыдущей страницы
@@ -181,10 +182,12 @@ def translate_chunk(chunk: str, req_id: str, context: str = None) -> str:
     # Формируем сообщение пользователя с контекстом, если он есть
     if context:
         user_message = (
-            f"CONTEXT FROM PREVIOUS PAGE (for reference only, DO NOT translate this):\n"
-            f"...{context}\n\n"
-            f"---\n\n"
-            f"CURRENT PAGE TEXT (translate this):\n{chunk}"
+            f"[CONTEXT - DO NOT TRANSLATE, for understanding only]\n"
+            f"...{context}\n"
+            f"[END CONTEXT]\n\n"
+            f"[CURRENT PAGE TEXT - TRANSLATE THIS EXACTLY]\n"
+            f"{chunk}\n"
+            f"[END OF TEXT TO TRANSLATE]"
         )
         system_prompt = SYSTEM_PROMPT_WITH_CONTEXT
     else:
