@@ -49,9 +49,18 @@ R2_ENDPOINT = os.getenv("R2_ENDPOINT")
 R2_ACCESS_KEY = os.getenv("R2_ACCESS_KEY")
 R2_SECRET_KEY = os.getenv("R2_SECRET_KEY")
 
+# LLM Provider: "deepseek" or "routellm"
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "deepseek")
+
+# DeepSeek API
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
+DEEPSEEK_URL = os.getenv("DEEPSEEK_URL", "https://api.deepseek.com/chat/completions")
+DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+
+# RouteLLM API (fallback)
 ROUTELLM_API_KEY = os.getenv("ROUTELLM_API_KEY")
 ROUTELLM_URL = os.getenv("ROUTELLM_URL", "https://routellm.abacus.ai/v1/chat/completions")
-MODEL = os.getenv("MODEL", "gpt-4o-mini")
+ROUTELLM_MODEL = os.getenv("ROUTELLM_MODEL", "gpt-4o-mini")
 
 POLL_SECONDS = int(os.getenv("WORKER_POLL_SECONDS", "5"))
 PDF_BATCH_SIZE = int(os.getenv("PDF_BATCH_SIZE", "20"))
@@ -126,13 +135,23 @@ def env_sanity():
         ("R2_ENDPOINT", R2_ENDPOINT),
         ("R2_ACCESS_KEY", R2_ACCESS_KEY),
         ("R2_SECRET_KEY", R2_SECRET_KEY),
-        ("ROUTELLM_API_KEY", ROUTELLM_API_KEY),
     ]:
         if not v:
             missing.append(k)
+
+    # Проверяем API ключ в зависимости от провайдера
+    if LLM_PROVIDER == "deepseek":
+        if not DEEPSEEK_API_KEY:
+            missing.append("DEEPSEEK_API_KEY")
+    else:
+        if not ROUTELLM_API_KEY:
+            missing.append("ROUTELLM_API_KEY")
+
     if missing:
         logger.error(f"Missing env vars: {', '.join(missing)}")
         return False
+
+    logger.info(f"LLM Provider: {LLM_PROVIDER}")
     return True
 
 
@@ -206,8 +225,18 @@ def translate_chunk(chunk: str, req_id: str, context: str = None, lookahead: str
     if not chunk or len(chunk.strip()) < 5:
         return ""
 
+    # Выбираем провайдера
+    if LLM_PROVIDER == "deepseek":
+        api_key = DEEPSEEK_API_KEY
+        api_url = DEEPSEEK_URL
+        model = DEEPSEEK_MODEL
+    else:
+        api_key = ROUTELLM_API_KEY
+        api_url = ROUTELLM_URL
+        model = ROUTELLM_MODEL
+
     headers = {
-        "Authorization": f"Bearer {ROUTELLM_API_KEY}",
+        "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
 
@@ -244,7 +273,7 @@ def translate_chunk(chunk: str, req_id: str, context: str = None, lookahead: str
         system_prompt = SYSTEM_PROMPT
 
     payload = {
-        "model": MODEL,
+        "model": model,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_message},
@@ -257,7 +286,7 @@ def translate_chunk(chunk: str, req_id: str, context: str = None, lookahead: str
         try:
             t0 = time.time()
             resp = requests.post(
-                ROUTELLM_URL,
+                api_url,
                 headers=headers,
                 json=payload,
                 timeout=LLM_TIMEOUT_SECONDS,
@@ -274,7 +303,7 @@ def translate_chunk(chunk: str, req_id: str, context: str = None, lookahead: str
             data = resp.json()
 
             out = data["choices"][0]["message"]["content"]
-            logger.info(f"[{req_id}] LLM ok in {dt:.2f}s (chars_in={len(chunk)}, chars_out={len(out)})")
+            logger.info(f"[{req_id}] LLM ok ({LLM_PROVIDER}/{model}) in {dt:.2f}s (chars_in={len(chunk)}, chars_out={len(out)})")
             return out
 
         except Exception as e:
