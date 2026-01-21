@@ -81,11 +81,15 @@ SYSTEM_PROMPT_WITH_CONTEXT = (
     "CRITICAL RULES:\n"
     "1. Translate ONLY the text marked as 'CURRENT PAGE TEXT'. Do NOT add any extra words or sentences.\n"
     "2. Do NOT invent, add, or generate any text that is not in the original.\n"
-    "3. The CONTEXT is provided ONLY to help you understand incomplete sentences at the start of the page. "
-    "Do NOT translate or include the context in your output.\n"
-    "4. If the page starts with a partial word or sentence fragment, translate it correctly based on context.\n"
-    "5. Keep the original formatting, line breaks, and structure exactly as they are.\n"
-    "6. Output ONLY the translation of 'CURRENT PAGE TEXT'. Nothing more, nothing less."
+    "3. CONTEXT FROM PREVIOUS PAGE helps understand how the current page begins (incomplete sentences). "
+    "Use it for understanding, but do NOT include it in your translation.\n"
+    "4. NEXT PAGE PREVIEW helps you understand how the current page ends. "
+    "Use it to correctly decline/conjugate the LAST words of the current page in Russian "
+    "(correct grammatical case, gender, number). Do NOT translate the preview.\n"
+    "5. If the page starts with a partial sentence, translate it correctly based on previous context.\n"
+    "6. If the page ends mid-sentence, use the next page preview to choose correct Russian word forms.\n"
+    "7. Keep the original formatting, line breaks, and structure exactly as they are.\n"
+    "8. Output ONLY the translation of 'CURRENT PAGE TEXT'. Nothing more, nothing less."
 )
 
 # Сколько символов контекста брать с предыдущей страницы
@@ -163,13 +167,33 @@ def get_page_tail(text: str, max_chars: int = CONTEXT_CHARS) -> str:
     return tail.strip()
 
 
+def get_page_head(text: str, max_chars: int = 200) -> str:
+    """
+    Извлекает первые N символов текста для использования как lookahead.
+    Старается не обрезать слова посередине.
+    """
+    if not text or len(text) <= max_chars:
+        return text
+
+    # Берём первые max_chars символов
+    head = text[:max_chars]
+
+    # Пытаемся найти конец слова (пробел с конца)
+    space_idx = head.rfind(' ')
+    if space_idx > len(head) // 2:
+        head = head[:space_idx]
+
+    return head.strip()
+
+
 # ----------------------------
 # RouteLLM call with retries
 # ----------------------------
-def translate_chunk(chunk: str, req_id: str, context: str = None) -> str:
+def translate_chunk(chunk: str, req_id: str, context: str = None, lookahead: str = None) -> str:
     """
     Returns translated text. On failure returns original chunk (so pipeline doesn't break).
     context: опциональный контекст с предыдущей страницы для понимания разорванных предложений
+    lookahead: опциональное начало следующей страницы для правильного согласования окончаний
     """
     if not chunk or len(chunk.strip()) < 5:
         return ""
@@ -179,16 +203,33 @@ def translate_chunk(chunk: str, req_id: str, context: str = None) -> str:
         "Content-Type": "application/json",
     }
 
-    # Формируем сообщение пользователя с контекстом, если он есть
-    if context:
-        user_message = (
-            f"[CONTEXT - DO NOT TRANSLATE, for understanding only]\n"
-            f"...{context}\n"
-            f"[END CONTEXT]\n\n"
-            f"[CURRENT PAGE TEXT - TRANSLATE THIS EXACTLY]\n"
+    # Формируем сообщение пользователя с контекстом и/или lookahead
+    has_context = context or lookahead
+
+    if has_context:
+        parts = []
+
+        if context:
+            parts.append(
+                f"[CONTEXT FROM PREVIOUS PAGE - for understanding sentence beginnings]\n"
+                f"...{context}\n"
+                f"[END PREVIOUS CONTEXT]"
+            )
+
+        parts.append(
+            f"\n[CURRENT PAGE TEXT - TRANSLATE THIS EXACTLY]\n"
             f"{chunk}\n"
             f"[END OF TEXT TO TRANSLATE]"
         )
+
+        if lookahead:
+            parts.append(
+                f"\n[NEXT PAGE PREVIEW - for understanding how current page ends, DO NOT translate]\n"
+                f"{lookahead}...\n"
+                f"[END NEXT PAGE PREVIEW]"
+            )
+
+        user_message = "\n".join(parts)
         system_prompt = SYSTEM_PROMPT_WITH_CONTEXT
     else:
         user_message = chunk
@@ -238,21 +279,23 @@ def translate_chunk(chunk: str, req_id: str, context: str = None) -> str:
     return chunk
 
 
-def translate_text(text: str, req_id: str, context: str = None) -> str:
+def translate_text(text: str, req_id: str, context: str = None, lookahead: str = None) -> str:
     """
-    Переводит текст с опциональным контекстом предыдущей страницы.
-    Контекст передаётся только в первый чанк.
+    Переводит текст с опциональным контекстом предыдущей страницы и lookahead следующей.
+    Контекст передаётся только в первый чанк, lookahead — только в последний.
     """
     chunks = chunk_text_preserving_lines(text, MAX_CHARS_PER_CHUNK)
     if len(chunks) == 1:
-        return translate_chunk(chunks[0], req_id, context=context)
+        return translate_chunk(chunks[0], req_id, context=context, lookahead=lookahead)
 
     out_parts = []
     for idx, ch in enumerate(chunks, start=1):
         part_id = f"{req_id}.c{idx}/{len(chunks)}"
         # Контекст передаём только в первый чанк
         chunk_context = context if idx == 1 else None
-        out_parts.append(translate_chunk(ch, part_id, context=chunk_context))
+        # Lookahead передаём только в последний чанк
+        chunk_lookahead = lookahead if idx == len(chunks) else None
+        out_parts.append(translate_chunk(ch, part_id, context=chunk_context, lookahead=chunk_lookahead))
     return "".join(out_parts)
 
 
@@ -369,12 +412,28 @@ def process_job(db: Session, job: Job):
                         else:
                             # Передаём контекст предыдущей страницы для склейки предложений
                             context = prev_page_tail if prev_page_tail else None
-                            if context:
-                                logger.info(f"[{page_id}] translating (chars={len(text)}) with context ({len(context)} chars)")
-                            else:
-                                logger.info(f"[{page_id}] translating (chars={len(text)})")
 
-                            translated = translate_text(text, page_id, context=context)
+                            # Получаем lookahead (начало следующей страницы) для правильного согласования
+                            lookahead = None
+                            if i + 1 < total_pages:
+                                try:
+                                    next_page = pdf.pages[i + 1]
+                                    next_text = next_page.extract_text() or ""
+                                    if next_text.strip():
+                                        lookahead = get_page_head(next_text, 200)
+                                except Exception as e:
+                                    logger.warning(f"[{page_id}] failed to get lookahead: {e}")
+
+                            # Логируем информацию о контексте
+                            ctx_info = []
+                            if context:
+                                ctx_info.append(f"context={len(context)}")
+                            if lookahead:
+                                ctx_info.append(f"lookahead={len(lookahead)}")
+                            ctx_str = f" with {', '.join(ctx_info)}" if ctx_info else ""
+                            logger.info(f"[{page_id}] translating (chars={len(text)}){ctx_str}")
+
+                            translated = translate_text(text, page_id, context=context, lookahead=lookahead)
                             out.write(f"--- Page {page_no} ---\n{translated}\n\n")
                             out.flush()
 
