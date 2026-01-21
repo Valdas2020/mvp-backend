@@ -526,9 +526,13 @@ def process_job(db: Session, job: Job):
 def run_worker():
     logger.info("=" * 70)
     logger.info("🚀 PDF Translation Worker Starting")
-    logger.info(f"📦 Model: {MODEL}")
+    if LLM_PROVIDER == "deepseek":
+        logger.info(f"📦 Provider: DeepSeek, Model: {DEEPSEEK_MODEL}")
+        logger.info(f"🌐 API URL: {DEEPSEEK_URL}")
+    else:
+        logger.info(f"📦 Provider: RouteLLM, Model: {ROUTELLM_MODEL}")
+        logger.info(f"🌐 API URL: {ROUTELLM_URL}")
     logger.info(f"🪣 R2 Bucket: {R2_BUCKET}")
-    logger.info(f"🌐 RouteLLM URL: {ROUTELLM_URL}")
     logger.info(f"⏱️ poll={POLL_SECONDS}s batch={PDF_BATCH_SIZE} checkpoint_every={CHECKPOINT_EVERY_PAGES} pages")
     logger.info("=" * 70)
 
