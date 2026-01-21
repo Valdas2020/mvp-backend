@@ -75,6 +75,21 @@ SYSTEM_PROMPT = os.getenv(
     )
 )
 
+# Улучшенный промпт с контекстом для склейки страниц
+SYSTEM_PROMPT_WITH_CONTEXT = (
+    "You are a professional translator. Translate the following text from English to Russian.\n\n"
+    "IMPORTANT RULES:\n"
+    "1. Keep the original formatting, line breaks, and structure exactly as they are.\n"
+    "2. The text may start mid-sentence (continuation from previous page). "
+    "Translate it naturally, maintaining grammatical coherence.\n"
+    "3. If CONTEXT FROM PREVIOUS PAGE is provided, use it to understand incomplete sentences, "
+    "but DO NOT include the context in your translation - only translate the CURRENT PAGE TEXT.\n"
+    "4. Do not add any explanations, only provide the translation."
+)
+
+# Сколько символов контекста брать с предыдущей страницы
+CONTEXT_CHARS = int(os.getenv("CONTEXT_CHARS", "500"))
+
 # ----------------------------
 # R2 client
 # ----------------------------
@@ -128,12 +143,32 @@ def chunk_text_preserving_lines(text: str, max_chars: int):
     return chunks
 
 
+def get_page_tail(text: str, max_chars: int = CONTEXT_CHARS) -> str:
+    """
+    Извлекает последние N символов текста для использования как контекст.
+    Старается не обрезать слова посередине.
+    """
+    if not text or len(text) <= max_chars:
+        return text
+
+    # Берём последние max_chars символов
+    tail = text[-max_chars:]
+
+    # Пытаемся найти начало слова (пробел)
+    space_idx = tail.find(' ')
+    if space_idx > 0 and space_idx < len(tail) // 2:
+        tail = tail[space_idx + 1:]
+
+    return tail.strip()
+
+
 # ----------------------------
 # RouteLLM call with retries
 # ----------------------------
-def translate_chunk(chunk: str, req_id: str) -> str:
+def translate_chunk(chunk: str, req_id: str, context: str = None) -> str:
     """
     Returns translated text. On failure returns original chunk (so pipeline doesn't break).
+    context: опциональный контекст с предыдущей страницы для понимания разорванных предложений
     """
     if not chunk or len(chunk.strip()) < 5:
         return ""
@@ -143,11 +178,24 @@ def translate_chunk(chunk: str, req_id: str) -> str:
         "Content-Type": "application/json",
     }
 
+    # Формируем сообщение пользователя с контекстом, если он есть
+    if context:
+        user_message = (
+            f"CONTEXT FROM PREVIOUS PAGE (for reference only, DO NOT translate this):\n"
+            f"...{context}\n\n"
+            f"---\n\n"
+            f"CURRENT PAGE TEXT (translate this):\n{chunk}"
+        )
+        system_prompt = SYSTEM_PROMPT_WITH_CONTEXT
+    else:
+        user_message = chunk
+        system_prompt = SYSTEM_PROMPT
+
     payload = {
         "model": MODEL,
         "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": chunk},
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message},
         ],
         "temperature": 0.3,
     }
@@ -187,15 +235,21 @@ def translate_chunk(chunk: str, req_id: str) -> str:
     return chunk
 
 
-def translate_text(text: str, req_id: str) -> str:
+def translate_text(text: str, req_id: str, context: str = None) -> str:
+    """
+    Переводит текст с опциональным контекстом предыдущей страницы.
+    Контекст передаётся только в первый чанк.
+    """
     chunks = chunk_text_preserving_lines(text, MAX_CHARS_PER_CHUNK)
     if len(chunks) == 1:
-        return translate_chunk(chunks[0], req_id)
+        return translate_chunk(chunks[0], req_id, context=context)
 
     out_parts = []
     for idx, ch in enumerate(chunks, start=1):
         part_id = f"{req_id}.c{idx}/{len(chunks)}"
-        out_parts.append(translate_chunk(ch, part_id))
+        # Контекст передаём только в первый чанк
+        chunk_context = context if idx == 1 else None
+        out_parts.append(translate_chunk(ch, part_id, context=chunk_context))
     return "".join(out_parts)
 
 
@@ -283,6 +337,9 @@ def process_job(db: Session, job: Job):
         logger.info(f"[{req_id}] PDF pages={total_pages} resume_from_page={last_page_done + 1}")
 
         # Write output progressively
+        # Храним контекст (хвост) предыдущей страницы для склейки предложений
+        prev_page_tail = ""
+
         with open(local_output, mode, encoding="utf-8") as out:
             # Process batches to reduce memory
             for batch_start in range(last_page_done, total_pages, PDF_BATCH_SIZE):
@@ -305,11 +362,21 @@ def process_job(db: Session, job: Job):
                             logger.info(f"[{page_id}] empty page text; writing marker only")
                             out.write(f"--- Page {page_no} ---\n\n")
                             out.flush()
+                            prev_page_tail = ""  # Сбрасываем контекст для пустых страниц
                         else:
-                            logger.info(f"[{page_id}] translating (chars={len(text)})")
-                            translated = translate_text(text, page_id)
+                            # Передаём контекст предыдущей страницы для склейки предложений
+                            context = prev_page_tail if prev_page_tail else None
+                            if context:
+                                logger.info(f"[{page_id}] translating (chars={len(text)}) with context ({len(context)} chars)")
+                            else:
+                                logger.info(f"[{page_id}] translating (chars={len(text)})")
+
+                            translated = translate_text(text, page_id, context=context)
                             out.write(f"--- Page {page_no} ---\n{translated}\n\n")
                             out.flush()
+
+                            # Сохраняем хвост текущей страницы для следующей
+                            prev_page_tail = get_page_tail(text, CONTEXT_CHARS)
 
                         # checkpoint
                         if page_no % CHECKPOINT_EVERY_PAGES == 0:
