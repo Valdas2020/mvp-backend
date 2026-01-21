@@ -51,7 +51,7 @@ R2_SECRET_KEY = os.getenv("R2_SECRET_KEY")
 
 ROUTELLM_API_KEY = os.getenv("ROUTELLM_API_KEY")
 ROUTELLM_URL = os.getenv("ROUTELLM_URL", "https://routellm.abacus.ai/v1/chat/completions")
-MODEL = os.getenv("MODEL", "gpt-5-mini")
+MODEL = os.getenv("MODEL", "gpt-4o-mini")
 
 POLL_SECONDS = int(os.getenv("WORKER_POLL_SECONDS", "5"))
 PDF_BATCH_SIZE = int(os.getenv("PDF_BATCH_SIZE", "20"))
