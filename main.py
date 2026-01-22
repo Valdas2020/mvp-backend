@@ -318,6 +318,7 @@ def list_jobs(token: str = Query(...), db: Session = Depends(get_db)):
 @app.get("/api/jobs/{job_id}/download")
 def download_job(job_id: int, token: str = Query(...), db: Session = Depends(get_db)):
     user_id = decode_user_id(token)
+    print(f"[DOWNLOAD] job_id={job_id} user_id={user_id}", flush=True)
 
     job = (
         db.query(Job)
@@ -325,7 +326,11 @@ def download_job(job_id: int, token: str = Query(...), db: Session = Depends(get
         .first()
     )
     if not job:
+        print(f"[DOWNLOAD] Job not found", flush=True)
         raise HTTPException(status_code=404, detail="Job not found")
+
+    print(f"[DOWNLOAD] job.status={job.status} r2_key_output={job.r2_key_output}", flush=True)
+
     if not job.r2_key_output:
         raise HTTPException(status_code=404, detail="File not ready")
 
@@ -339,6 +344,7 @@ def download_job(job_id: int, token: str = Query(...), db: Session = Depends(get
             },
             ExpiresIn=3600,
         )
+        print(f"[DOWNLOAD] presigned URL generated, length={len(presigned_url)}", flush=True)
     except Exception as e:
         print(f"[DOWNLOAD] presign failed: {e}", flush=True)
         raise HTTPException(status_code=500, detail="Failed to generate download URL")
@@ -346,6 +352,7 @@ def download_job(job_id: int, token: str = Query(...), db: Session = Depends(get
     # Proxy (forces download reliably)
     try:
         r = requests.get(presigned_url, stream=True, timeout=30)
+        print(f"[DOWNLOAD] R2 response status={r.status_code}", flush=True)
         r.raise_for_status()
         return StreamingResponse(
             r.iter_content(chunk_size=8192),
