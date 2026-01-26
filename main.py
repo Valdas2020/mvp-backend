@@ -39,9 +39,15 @@ STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
 STRIPE_SUCCESS_URL = os.getenv("STRIPE_SUCCESS_URL", "https://mvp-frontend-rho.vercel.app/payment/success")
 STRIPE_CANCEL_URL = os.getenv("STRIPE_CANCEL_URL", "https://mvp-frontend-rho.vercel.app/payment/cancel")
 
-# Wallet Pay config (Telegram)
+# Wallet Pay config (Telegram) - DEPRECATED, use CryptoBot
 WALLET_PAY_TOKEN = os.getenv("WALLET_PAY_TOKEN")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+
+# CryptoBot config (crypto payments via @CryptoBot)
+CRYPTOBOT_API_TOKEN = os.getenv("CRYPTOBOT_API_TOKEN")
+# Use testnet for testing: https://testnet-pay.crypt.bot/api
+# Use production: https://pay.crypt.bot/api
+CRYPTOBOT_API_URL = os.getenv("CRYPTOBOT_API_URL", "https://pay.crypt.bot/api")
 
 # Frontend URL
 FRONTEND_URL = os.getenv("FRONTEND_URL", "https://mvp-frontend-rho.vercel.app")
@@ -153,6 +159,11 @@ class CreateCheckoutRequest(BaseModel):
 class WalletPayOrderRequest(BaseModel):
     tier: str
     telegram_user_id: str
+
+
+class CryptoBotInvoiceRequest(BaseModel):
+    tier: str  # "S", "M", "L"
+    asset: str = "USDT"  # USDT or TON
 
 
 # ----------------------------
@@ -772,6 +783,198 @@ async def wallet_pay_webhook(request: Request, db: Session = Depends(get_db)):
 def get_wallet_pay_order(order_id: str, db: Session = Depends(get_db)):
     """Get payment status and invite code after successful payment"""
     payment = db.query(Payment).filter(Payment.wallet_pay_order_id == order_id).first()
+
+    if not payment:
+        raise HTTPException(status_code=404, detail="Payment not found")
+
+    return {
+        "status": payment.status,
+        "tier": payment.tier,
+        "quota_words": payment.quota_words,
+        "invite_code": payment.invite_code if payment.status == "completed" else None,
+    }
+
+
+# ========================================
+# CRYPTOBOT PAYMENTS (@CryptoBot)
+# ========================================
+
+@app.post("/api/cryptobot/create-invoice")
+def create_cryptobot_invoice(req: CryptoBotInvoiceRequest, db: Session = Depends(get_db)):
+    """Create CryptoBot invoice for crypto payment (USDT/TON)"""
+    if not CRYPTOBOT_API_TOKEN:
+        raise HTTPException(status_code=503, detail="CryptoBot not configured")
+
+    tier = req.tier.upper()
+    if tier not in TIER_CONFIG:
+        raise HTTPException(status_code=400, detail=f"Invalid tier: {tier}")
+
+    asset = req.asset.upper()
+    if asset not in ["USDT", "TON"]:
+        raise HTTPException(status_code=400, detail="Asset must be USDT or TON")
+
+    config = TIER_CONFIG[tier]
+
+    # Determine amount based on asset
+    if asset == "USDT":
+        amount = str(config["price_usd"])
+    else:  # TON
+        amount = str(config["price_ton"])
+
+    # Generate unique invite code
+    invite_code = generate_invite_code()
+    while db.query(Payment).filter(Payment.invite_code == invite_code).first():
+        invite_code = generate_invite_code()
+
+    # Create invoice via CryptoBot API
+    try:
+        response = requests.post(
+            f"{CRYPTOBOT_API_URL}/createInvoice",
+            headers={
+                "Crypto-Pay-API-Token": CRYPTOBOT_API_TOKEN,
+                "Content-Type": "application/json",
+            },
+            json={
+                "asset": asset,
+                "amount": amount,
+                "description": f"PDF Translator - Tier {tier} ({config['words']:,} words)",
+                "hidden_message": f"Your activation code: {invite_code}",
+                "paid_btn_name": "openBot",
+                "paid_btn_url": f"{FRONTEND_URL}/payment/success?crypto_invoice={invite_code}",
+                "payload": f"{tier}:{invite_code}",
+                "allow_comments": False,
+                "allow_anonymous": True,
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        if not data.get("ok"):
+            print(f"[CRYPTOBOT] Invoice creation failed: {data}", flush=True)
+            raise HTTPException(status_code=500, detail="Failed to create invoice")
+
+        invoice = data["result"]
+        invoice_id = str(invoice["invoice_id"])
+        pay_url = invoice["pay_url"]
+
+        # Create pending payment record
+        payment = Payment(
+            invite_code=invite_code,
+            tier=tier,
+            quota_words=config["words"],
+            amount=float(amount),
+            currency=asset,
+            payment_method="cryptobot",
+            cryptobot_invoice_id=invoice_id,
+            status="pending",
+        )
+        db.add(payment)
+        db.commit()
+
+        print(f"[CRYPTOBOT] Created invoice={invoice_id} tier={tier} code={invite_code} asset={asset}", flush=True)
+
+        return {
+            "pay_url": pay_url,
+            "invoice_id": invoice_id,
+        }
+
+    except requests.RequestException as e:
+        print(f"[CRYPTOBOT] Request error: {e}", flush=True)
+        raise HTTPException(status_code=500, detail="Failed to connect to CryptoBot")
+
+
+@app.post("/webhook/cryptobot")
+async def cryptobot_webhook(request: Request, db: Session = Depends(get_db)):
+    """Handle CryptoBot webhook events"""
+    payload = await request.body()
+
+    # Verify webhook signature
+    # CryptoBot sends signature in Crypto-Pay-Api-Signature header
+    signature = request.headers.get("Crypto-Pay-Api-Signature")
+
+    if CRYPTOBOT_API_TOKEN and signature:
+        # Compute expected signature: HMAC-SHA256 of request body with API token
+        expected_sig = hmac.new(
+            hashlib.sha256(CRYPTOBOT_API_TOKEN.encode()).digest(),
+            payload,
+            hashlib.sha256
+        ).hexdigest()
+
+        if not hmac.compare_digest(signature, expected_sig):
+            print("[CRYPTOBOT WEBHOOK] Invalid signature", flush=True)
+            raise HTTPException(status_code=400, detail="Invalid signature")
+
+    try:
+        import json
+        data = json.loads(payload)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    print(f"[CRYPTOBOT WEBHOOK] Received: {data}", flush=True)
+
+    # Handle invoice_paid event
+    update_type = data.get("update_type")
+    if update_type == "invoice_paid":
+        invoice_data = data.get("payload", {})
+        invoice_id = str(invoice_data.get("invoice_id"))
+        payload_str = invoice_data.get("payload", "")  # "TIER:INVITE_CODE"
+
+        # Parse payload to get tier and invite_code
+        if ":" in payload_str:
+            tier, invite_code = payload_str.split(":", 1)
+        else:
+            print(f"[CRYPTOBOT WEBHOOK] Invalid payload format: {payload_str}", flush=True)
+            return {"status": "error"}
+
+        # Find payment by invoice_id
+        payment = db.query(Payment).filter(Payment.cryptobot_invoice_id == invoice_id).first()
+
+        if not payment:
+            # Try to find by invite_code as fallback
+            payment = db.query(Payment).filter(
+                Payment.invite_code == invite_code,
+                Payment.payment_method == "cryptobot"
+            ).first()
+
+        if not payment:
+            print(f"[CRYPTOBOT WEBHOOK] Payment not found for invoice {invoice_id}", flush=True)
+            return {"status": "error"}
+
+        if payment.status == "completed":
+            print(f"[CRYPTOBOT WEBHOOK] Payment already completed: {invoice_id}", flush=True)
+            return {"status": "ok"}
+
+        # Update payment status
+        payment.status = "completed"
+        payment.completed_at = datetime.utcnow()
+
+        # Create InviteCode record for backward compatibility
+        existing_code = db.query(InviteCode).filter(InviteCode.code == payment.invite_code).first()
+        if not existing_code:
+            invite = InviteCode(
+                code=payment.invite_code,
+                tier=payment.tier,
+                quota_words=payment.quota_words,
+                max_uses=1,
+                used_count=0,
+            )
+            db.add(invite)
+
+        db.commit()
+
+        print(f"[CRYPTOBOT WEBHOOK] Payment completed! code={payment.invite_code} tier={payment.tier}", flush=True)
+
+    return {"status": "ok"}
+
+
+@app.get("/api/cryptobot/invoice/{invoice_code}")
+def get_cryptobot_invoice(invoice_code: str, db: Session = Depends(get_db)):
+    """Get payment status and invite code by invite_code (from success URL)"""
+    payment = db.query(Payment).filter(
+        Payment.invite_code == invoice_code,
+        Payment.payment_method == "cryptobot"
+    ).first()
 
     if not payment:
         raise HTTPException(status_code=404, detail="Payment not found")

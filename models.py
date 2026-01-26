@@ -124,6 +124,7 @@ class Payment(Base):
     stripe_session_id = Column(String, nullable=True, unique=True)
     stripe_payment_intent = Column(String, nullable=True)
     wallet_pay_order_id = Column(String, nullable=True, unique=True)
+    cryptobot_invoice_id = Column(String, nullable=True, unique=True)  # CryptoBot invoice ID
 
     # User contact (for sending the code)
     email = Column(String, nullable=True)
