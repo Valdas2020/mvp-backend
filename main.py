@@ -828,6 +828,9 @@ def create_cryptobot_invoice(req: CryptoBotInvoiceRequest, db: Session = Depends
 
     # Create invoice via CryptoBot API
     try:
+        print(f"[CRYPTOBOT] Creating invoice: tier={tier} asset={asset} amount={amount}", flush=True)
+        print(f"[CRYPTOBOT] API URL: {CRYPTOBOT_API_URL}/createInvoice", flush=True)
+
         response = requests.post(
             f"{CRYPTOBOT_API_URL}/createInvoice",
             headers={
@@ -847,12 +850,16 @@ def create_cryptobot_invoice(req: CryptoBotInvoiceRequest, db: Session = Depends
             },
             timeout=30,
         )
-        response.raise_for_status()
+
+        print(f"[CRYPTOBOT] Response status: {response.status_code}", flush=True)
+        print(f"[CRYPTOBOT] Response body: {response.text}", flush=True)
+
         data = response.json()
 
         if not data.get("ok"):
+            error_msg = data.get("error", {})
             print(f"[CRYPTOBOT] Invoice creation failed: {data}", flush=True)
-            raise HTTPException(status_code=500, detail="Failed to create invoice")
+            raise HTTPException(status_code=500, detail=f"CryptoBot error: {error_msg}")
 
         invoice = data["result"]
         invoice_id = str(invoice["invoice_id"])
@@ -881,6 +888,8 @@ def create_cryptobot_invoice(req: CryptoBotInvoiceRequest, db: Session = Depends
 
     except requests.RequestException as e:
         print(f"[CRYPTOBOT] Request error: {e}", flush=True)
+        if hasattr(e, 'response') and e.response is not None:
+            print(f"[CRYPTOBOT] Error response: {e.response.text}", flush=True)
         raise HTTPException(status_code=500, detail="Failed to connect to CryptoBot")
 
 
