@@ -1,5 +1,7 @@
 import os
 import time
+import hmac
+import hashlib
 from datetime import datetime, timedelta
 from uuid import uuid4
 
@@ -7,14 +9,18 @@ import jwt
 import boto3
 from botocore.client import Config
 import requests
+import stripe
 
-from fastapi import FastAPI, Depends, HTTPException, Query, UploadFile, File
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, Depends, HTTPException, Query, UploadFile, File, Request
+from fastapi.responses import StreamingResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 
-from models import SessionLocal, User, InviteCode, OTP, Job, Usage  # noqa: F401
+from models import (
+    SessionLocal, User, InviteCode, OTP, Job, Usage,
+    Payment, TIER_CONFIG, generate_invite_code
+)  # noqa: F401
 
 
 # ----------------------------
@@ -26,6 +32,23 @@ R2_BUCKET = os.getenv("R2_BUCKET")
 R2_ENDPOINT = os.getenv("R2_ENDPOINT")
 R2_ACCESS_KEY = os.getenv("R2_ACCESS_KEY")
 R2_SECRET_KEY = os.getenv("R2_SECRET_KEY")
+
+# Stripe config
+STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
+STRIPE_SUCCESS_URL = os.getenv("STRIPE_SUCCESS_URL", "https://mvp-frontend-rho.vercel.app/payment/success")
+STRIPE_CANCEL_URL = os.getenv("STRIPE_CANCEL_URL", "https://mvp-frontend-rho.vercel.app/payment/cancel")
+
+# Wallet Pay config (Telegram)
+WALLET_PAY_TOKEN = os.getenv("WALLET_PAY_TOKEN")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+
+# Frontend URL
+FRONTEND_URL = os.getenv("FRONTEND_URL", "https://mvp-frontend-rho.vercel.app")
+
+# Initialize Stripe
+if STRIPE_SECRET_KEY:
+    stripe.api_key = STRIPE_SECRET_KEY
 
 # Basic sanity (helps catch misconfigured env early)
 if not JWT_SECRET or JWT_SECRET == "change-me":
@@ -120,6 +143,16 @@ class EmailRequest(BaseModel):
 class OTPVerifyRequest(BaseModel):
     email: str
     otp: str
+
+
+class CreateCheckoutRequest(BaseModel):
+    tier: str  # "S", "M", "L"
+    email: str | None = None  # Optional email for receipt
+
+
+class WalletPayOrderRequest(BaseModel):
+    tier: str
+    telegram_user_id: str
 
 
 # ----------------------------
@@ -382,6 +415,376 @@ def user_info(token: str = Query(...), db: Session = Depends(get_db)):
 
 
 # ========================================
+# STRIPE PAYMENTS
+# ========================================
+
+@app.get("/api/pricing")
+def get_pricing():
+    """Return available tiers and prices"""
+    return {
+        "tiers": [
+            {
+                "id": tier_id,
+                "words": config["words"],
+                "price_eur": config["price_eur"],
+                "price_usd": config["price_usd"],
+                "price_ton": config["price_ton"],
+            }
+            for tier_id, config in TIER_CONFIG.items()
+        ]
+    }
+
+
+@app.post("/api/stripe/create-checkout")
+def create_stripe_checkout(req: CreateCheckoutRequest, db: Session = Depends(get_db)):
+    """Create Stripe Checkout Session for one-time payment"""
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(status_code=503, detail="Stripe not configured")
+
+    tier = req.tier.upper()
+    if tier not in TIER_CONFIG:
+        raise HTTPException(status_code=400, detail=f"Invalid tier: {tier}")
+
+    config = TIER_CONFIG[tier]
+    price_cents = int(config["price_eur"] * 100)
+
+    # Generate unique invite code
+    invite_code = generate_invite_code()
+
+    # Ensure uniqueness
+    while db.query(Payment).filter(Payment.invite_code == invite_code).first():
+        invite_code = generate_invite_code()
+
+    try:
+        # Create Stripe Checkout Session
+        session = stripe.checkout.Session.create(
+            payment_method_types=["card"],
+            line_items=[{
+                "price_data": {
+                    "currency": "eur",
+                    "product_data": {
+                        "name": f"PDF Translator - Tier {tier}",
+                        "description": f"{config['words']:,} words translation quota",
+                    },
+                    "unit_amount": price_cents,
+                },
+                "quantity": 1,
+            }],
+            mode="payment",
+            success_url=f"{STRIPE_SUCCESS_URL}?session_id={{CHECKOUT_SESSION_ID}}",
+            cancel_url=STRIPE_CANCEL_URL,
+            customer_email=req.email if req.email else None,
+            metadata={
+                "tier": tier,
+                "invite_code": invite_code,
+                "quota_words": str(config["words"]),
+            },
+        )
+
+        # Create pending payment record
+        payment = Payment(
+            invite_code=invite_code,
+            tier=tier,
+            quota_words=config["words"],
+            amount=config["price_eur"],
+            currency="EUR",
+            payment_method="stripe",
+            stripe_session_id=session.id,
+            email=req.email,
+            status="pending",
+        )
+        db.add(payment)
+        db.commit()
+
+        print(f"[STRIPE] Created checkout session={session.id} tier={tier} code={invite_code}", flush=True)
+
+        return {
+            "checkout_url": session.url,
+            "session_id": session.id,
+        }
+
+    except stripe.error.StripeError as e:
+        print(f"[STRIPE] Error creating checkout: {e}", flush=True)
+        raise HTTPException(status_code=500, detail="Failed to create checkout session")
+
+
+@app.post("/webhook/stripe")
+async def stripe_webhook(request: Request, db: Session = Depends(get_db)):
+    """Handle Stripe webhook events"""
+    payload = await request.body()
+    sig_header = request.headers.get("stripe-signature")
+
+    if not STRIPE_WEBHOOK_SECRET:
+        print("[STRIPE WEBHOOK] Warning: STRIPE_WEBHOOK_SECRET not set, skipping signature verification", flush=True)
+        event = stripe.Event.construct_from(
+            stripe.util.json.loads(payload), stripe.api_key
+        )
+    else:
+        try:
+            event = stripe.Webhook.construct_event(
+                payload, sig_header, STRIPE_WEBHOOK_SECRET
+            )
+        except ValueError:
+            print("[STRIPE WEBHOOK] Invalid payload", flush=True)
+            raise HTTPException(status_code=400, detail="Invalid payload")
+        except stripe.error.SignatureVerificationError:
+            print("[STRIPE WEBHOOK] Invalid signature", flush=True)
+            raise HTTPException(status_code=400, detail="Invalid signature")
+
+    print(f"[STRIPE WEBHOOK] Received event: {event['type']}", flush=True)
+
+    # Handle checkout.session.completed
+    if event["type"] == "checkout.session.completed":
+        session = event["data"]["object"]
+        session_id = session["id"]
+        payment_status = session.get("payment_status")
+
+        print(f"[STRIPE WEBHOOK] Session completed: {session_id}, payment_status={payment_status}", flush=True)
+
+        if payment_status == "paid":
+            # Find payment record
+            payment = db.query(Payment).filter(Payment.stripe_session_id == session_id).first()
+
+            if not payment:
+                print(f"[STRIPE WEBHOOK] Payment not found for session {session_id}", flush=True)
+                return {"status": "error", "message": "Payment not found"}
+
+            if payment.status == "completed":
+                print(f"[STRIPE WEBHOOK] Payment already completed: {session_id}", flush=True)
+                return {"status": "ok", "message": "Already processed"}
+
+            # Update payment status
+            payment.status = "completed"
+            payment.completed_at = datetime.utcnow()
+            payment.stripe_payment_intent = session.get("payment_intent")
+
+            # Also create an InviteCode record for backward compatibility
+            existing_code = db.query(InviteCode).filter(InviteCode.code == payment.invite_code).first()
+            if not existing_code:
+                invite = InviteCode(
+                    code=payment.invite_code,
+                    tier=payment.tier,
+                    quota_words=payment.quota_words,
+                    max_uses=1,
+                    used_count=0,
+                )
+                db.add(invite)
+
+            db.commit()
+
+            print(f"[STRIPE WEBHOOK] Payment completed! code={payment.invite_code} tier={payment.tier}", flush=True)
+
+            # TODO: Send email with invite code if email provided
+            if payment.email:
+                print(f"[STRIPE WEBHOOK] Should send code to {payment.email}", flush=True)
+
+    return {"status": "ok"}
+
+
+@app.get("/api/stripe/session/{session_id}")
+def get_stripe_session(session_id: str, db: Session = Depends(get_db)):
+    """Get payment status and invite code after successful payment"""
+    payment = db.query(Payment).filter(Payment.stripe_session_id == session_id).first()
+
+    if not payment:
+        raise HTTPException(status_code=404, detail="Payment not found")
+
+    return {
+        "status": payment.status,
+        "tier": payment.tier,
+        "quota_words": payment.quota_words,
+        "invite_code": payment.invite_code if payment.status == "completed" else None,
+    }
+
+
+# ========================================
+# WALLET PAY (TELEGRAM CRYPTO PAYMENTS)
+# ========================================
+
+@app.post("/api/wallet-pay/create-order")
+def create_wallet_pay_order(req: WalletPayOrderRequest, db: Session = Depends(get_db)):
+    """Create Wallet Pay order for crypto payment"""
+    if not WALLET_PAY_TOKEN:
+        raise HTTPException(status_code=503, detail="Wallet Pay not configured")
+
+    tier = req.tier.upper()
+    if tier not in TIER_CONFIG:
+        raise HTTPException(status_code=400, detail=f"Invalid tier: {tier}")
+
+    config = TIER_CONFIG[tier]
+
+    # Generate unique invite code
+    invite_code = generate_invite_code()
+    while db.query(Payment).filter(Payment.invite_code == invite_code).first():
+        invite_code = generate_invite_code()
+
+    # Create order via Wallet Pay API
+    # https://docs.wallet.tg/pay/
+    order_id = f"order_{int(time.time())}_{invite_code}"
+
+    try:
+        response = requests.post(
+            "https://pay.wallet.tg/wpay/store-api/v1/order",
+            headers={
+                "Wpay-Store-Api-Key": WALLET_PAY_TOKEN,
+                "Content-Type": "application/json",
+            },
+            json={
+                "amount": {
+                    "currencyCode": "USDT",
+                    "amount": str(config["price_usd"]),
+                },
+                "description": f"PDF Translator - Tier {tier} ({config['words']:,} words)",
+                "externalId": order_id,
+                "timeoutSeconds": 1800,  # 30 minutes
+                "customerTelegramUserId": int(req.telegram_user_id),
+                "returnUrl": f"{FRONTEND_URL}/payment/success?order_id={order_id}",
+                "failReturnUrl": f"{FRONTEND_URL}/payment/cancel",
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        if data.get("status") != "SUCCESS":
+            print(f"[WALLET PAY] Order creation failed: {data}", flush=True)
+            raise HTTPException(status_code=500, detail="Failed to create order")
+
+        pay_link = data["data"]["payLink"]
+
+        # Create pending payment record
+        payment = Payment(
+            invite_code=invite_code,
+            tier=tier,
+            quota_words=config["words"],
+            amount=config["price_usd"],
+            currency="USDT",
+            payment_method="wallet_pay",
+            wallet_pay_order_id=order_id,
+            telegram_user_id=req.telegram_user_id,
+            status="pending",
+        )
+        db.add(payment)
+        db.commit()
+
+        print(f"[WALLET PAY] Created order={order_id} tier={tier} code={invite_code}", flush=True)
+
+        return {
+            "pay_link": pay_link,
+            "order_id": order_id,
+        }
+
+    except requests.RequestException as e:
+        print(f"[WALLET PAY] Request error: {e}", flush=True)
+        raise HTTPException(status_code=500, detail="Failed to connect to Wallet Pay")
+
+
+@app.post("/webhook/wallet-pay")
+async def wallet_pay_webhook(request: Request, db: Session = Depends(get_db)):
+    """Handle Wallet Pay webhook events"""
+    payload = await request.body()
+
+    # Verify webhook signature
+    # https://docs.wallet.tg/pay/#section/Webhooks
+    timestamp = request.headers.get("WalletPay-Timestamp")
+    signature = request.headers.get("WalletPay-Signature")
+
+    if WALLET_PAY_TOKEN and timestamp and signature:
+        # Compute expected signature
+        message = f"{timestamp}.{payload.decode()}"
+        expected_sig = hmac.new(
+            WALLET_PAY_TOKEN.encode(),
+            message.encode(),
+            hashlib.sha256
+        ).hexdigest()
+
+        if not hmac.compare_digest(signature, expected_sig):
+            print("[WALLET PAY WEBHOOK] Invalid signature", flush=True)
+            raise HTTPException(status_code=400, detail="Invalid signature")
+
+    try:
+        import json
+        data = json.loads(payload)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    print(f"[WALLET PAY WEBHOOK] Received: {data}", flush=True)
+
+    # Handle payment completed
+    event_type = data.get("type")
+    if event_type == "ORDER_PAID":
+        order_data = data.get("payload", {})
+        order_id = order_data.get("externalId")
+
+        if not order_id:
+            print("[WALLET PAY WEBHOOK] Missing externalId", flush=True)
+            return {"status": "error"}
+
+        payment = db.query(Payment).filter(Payment.wallet_pay_order_id == order_id).first()
+
+        if not payment:
+            print(f"[WALLET PAY WEBHOOK] Payment not found for order {order_id}", flush=True)
+            return {"status": "error"}
+
+        if payment.status == "completed":
+            print(f"[WALLET PAY WEBHOOK] Payment already completed: {order_id}", flush=True)
+            return {"status": "ok"}
+
+        # Update payment status
+        payment.status = "completed"
+        payment.completed_at = datetime.utcnow()
+
+        # Create InviteCode record
+        existing_code = db.query(InviteCode).filter(InviteCode.code == payment.invite_code).first()
+        if not existing_code:
+            invite = InviteCode(
+                code=payment.invite_code,
+                tier=payment.tier,
+                quota_words=payment.quota_words,
+                max_uses=1,
+                used_count=0,
+            )
+            db.add(invite)
+
+        db.commit()
+
+        print(f"[WALLET PAY WEBHOOK] Payment completed! code={payment.invite_code} tier={payment.tier}", flush=True)
+
+        # TODO: Send code to user via Telegram Bot
+        if payment.telegram_user_id and TELEGRAM_BOT_TOKEN:
+            try:
+                requests.post(
+                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                    json={
+                        "chat_id": payment.telegram_user_id,
+                        "text": f"✅ Payment successful!\n\nYour invite code: `{payment.invite_code}`\n\nTier: {payment.tier}\nWords: {payment.quota_words:,}\n\nUse this code at {FRONTEND_URL}",
+                        "parse_mode": "Markdown",
+                    },
+                    timeout=10,
+                )
+            except Exception as e:
+                print(f"[WALLET PAY WEBHOOK] Failed to send Telegram message: {e}", flush=True)
+
+    return {"status": "ok"}
+
+
+@app.get("/api/wallet-pay/order/{order_id}")
+def get_wallet_pay_order(order_id: str, db: Session = Depends(get_db)):
+    """Get payment status and invite code after successful payment"""
+    payment = db.query(Payment).filter(Payment.wallet_pay_order_id == order_id).first()
+
+    if not payment:
+        raise HTTPException(status_code=404, detail="Payment not found")
+
+    return {
+        "status": payment.status,
+        "tier": payment.tier,
+        "quota_words": payment.quota_words,
+        "invite_code": payment.invite_code if payment.status == "completed" else None,
+    }
+
+
+# ========================================
 # ADMIN PANEL
 # ========================================
 @app.get("/api/admin/codes")
@@ -444,6 +847,50 @@ def admin_stats(admin_secret: str = Query(...), db: Session = Depends(get_db)):
         },
         "words_translated": total_words,
     }
+
+
+@app.get("/api/admin/payments")
+def admin_list_payments(admin_secret: str = Query(...), db: Session = Depends(get_db)):
+    """Список всех платежей"""
+    if admin_secret != ADMIN_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid admin secret")
+
+    payments = db.query(Payment).order_by(Payment.created_at.desc()).limit(100).all()
+
+    return {
+        "total": len(payments),
+        "payments": [
+            {
+                "id": p.id,
+                "invite_code": p.invite_code,
+                "tier": p.tier,
+                "amount": p.amount,
+                "currency": p.currency,
+                "payment_method": p.payment_method,
+                "status": p.status,
+                "email": p.email,
+                "telegram_user_id": p.telegram_user_id,
+                "created_at": p.created_at.isoformat() if p.created_at else None,
+                "completed_at": p.completed_at.isoformat() if p.completed_at else None,
+            }
+            for p in payments
+        ],
+        "stats": {
+            "total_completed": sum(1 for p in payments if p.status == "completed"),
+            "total_pending": sum(1 for p in payments if p.status == "pending"),
+            "revenue_eur": sum(p.amount for p in payments if p.status == "completed" and p.currency == "EUR"),
+            "revenue_usd": sum(p.amount for p in payments if p.status == "completed" and p.currency in ["USD", "USDT"]),
+        }
+    }
+
+
+# Initialize tables on startup
+from models import init_db, Base, engine
+try:
+    Base.metadata.create_all(bind=engine)
+    print("[STARTUP] Database tables initialized", flush=True)
+except Exception as e:
+    print(f"[STARTUP] DB init error: {e}", flush=True)
 
 
 if __name__ == "__main__":

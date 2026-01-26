@@ -1,8 +1,10 @@
 import os
 import sys
-from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, ForeignKey, Text
+from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, ForeignKey, Text, Float
 from sqlalchemy.orm import sessionmaker, relationship, declarative_base
 from datetime import datetime
+import secrets
+import string
 
 # --- 1. НАСТРОЙКА ПОДКЛЮЧЕНИЯ К БД ---
 database_url = os.getenv("DATABASE_URL")
@@ -80,3 +82,56 @@ class Usage(Base):
     timestamp = Column(DateTime, default=datetime.utcnow)
 
     user = relationship("User", back_populates="usages")
+
+
+# --- PAYMENT TRACKING ---
+
+# Tier configuration (one-time packages)
+TIER_CONFIG = {
+    "S": {"words": 200_000, "price_usd": 3, "price_eur": 3, "price_ton": 2},
+    "M": {"words": 500_000, "price_usd": 6, "price_eur": 6, "price_ton": 4},
+    "L": {"words": 1_200_000, "price_usd": 9, "price_eur": 9, "price_ton": 6},
+}
+
+
+def generate_invite_code(length=8):
+    """Generate a unique invite code like 'ABCD-1234'"""
+    chars = string.ascii_uppercase + string.digits
+    part1 = ''.join(secrets.choice(chars) for _ in range(4))
+    part2 = ''.join(secrets.choice(chars) for _ in range(4))
+    return f"{part1}-{part2}"
+
+
+class Payment(Base):
+    """Tracks all payment transactions for audit"""
+    __tablename__ = "app_payments"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    # Generated invite code (sent to user after payment)
+    invite_code = Column(String, unique=True, index=True, nullable=False)
+
+    # Tier info
+    tier = Column(String, nullable=False)  # "S", "M", "L"
+    quota_words = Column(Integer, nullable=False)
+
+    # Payment details
+    amount = Column(Float, nullable=False)
+    currency = Column(String, nullable=False)  # "USD", "EUR", "USDT", "TON"
+    payment_method = Column(String, nullable=False)  # "stripe", "wallet_pay"
+
+    # Provider-specific IDs
+    stripe_session_id = Column(String, nullable=True, unique=True)
+    stripe_payment_intent = Column(String, nullable=True)
+    wallet_pay_order_id = Column(String, nullable=True, unique=True)
+
+    # User contact (for sending the code)
+    email = Column(String, nullable=True)
+    telegram_user_id = Column(String, nullable=True)
+
+    # Status
+    status = Column(String, default="pending")  # "pending", "completed", "failed", "refunded"
+
+    # Timestamps
+    created_at = Column(DateTime, default=datetime.utcnow)
+    completed_at = Column(DateTime, nullable=True)

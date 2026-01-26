@@ -9,3 +9,5 @@ boto3
 pdfplumber
 requests
 PyJWT
+stripe
+python-telegram-bot
