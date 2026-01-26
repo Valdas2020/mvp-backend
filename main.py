@@ -1101,6 +1101,20 @@ from models import init_db, Base, engine
 try:
     Base.metadata.create_all(bind=engine)
     print("[STARTUP] Database tables initialized", flush=True)
+
+    # Migration: Add cryptobot_invoice_id column if it doesn't exist
+    with engine.connect() as conn:
+        from sqlalchemy import text
+        try:
+            conn.execute(text("""
+                ALTER TABLE app_payments
+                ADD COLUMN IF NOT EXISTS cryptobot_invoice_id VARCHAR UNIQUE
+            """))
+            conn.commit()
+            print("[STARTUP] Migration: cryptobot_invoice_id column ready", flush=True)
+        except Exception as migration_err:
+            print(f"[STARTUP] Migration note: {migration_err}", flush=True)
+
 except Exception as e:
     print(f"[STARTUP] DB init error: {e}", flush=True)
 
