@@ -49,6 +49,13 @@ CRYPTOBOT_API_TOKEN = os.getenv("CRYPTOBOT_API_TOKEN")
 # Use production: https://pay.crypt.bot/api
 CRYPTOBOT_API_URL = os.getenv("CRYPTOBOT_API_URL", "https://pay.crypt.bot/api")
 
+# SMTP Email config
+SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
+SMTP_FROM = os.getenv("SMTP_FROM")  # e.g., "PDF Translator <noreply@example.com>"
+
 # Frontend URL
 FRONTEND_URL = os.getenv("FRONTEND_URL", "https://mvp-frontend-rho.vercel.app")
 
@@ -131,6 +138,99 @@ def decode_user_id(token: str) -> int:
 
 
 # ----------------------------
+# Email helpers
+# ----------------------------
+def send_invite_code_email(to_email: str, invite_code: str, tier: str, quota_words: int) -> bool:
+    """Send invite code to customer via SMTP email"""
+    if not all([SMTP_HOST, SMTP_USER, SMTP_PASSWORD, SMTP_FROM]):
+        print(f"[EMAIL] SMTP not configured, skipping email to {to_email}", flush=True)
+        return False
+
+    import smtplib
+    from email.mime.text import MIMEText
+    from email.mime.multipart import MIMEMultipart
+
+    try:
+        # Create message
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = f"Ваш код активации PDF Переводчика - {invite_code}"
+        msg["From"] = SMTP_FROM
+        msg["To"] = to_email
+
+        # Plain text version
+        text_content = f"""
+Спасибо за покупку!
+
+Ваш код активации: {invite_code}
+
+Тариф: {tier}
+Лимит слов: {quota_words:,}
+
+Используйте этот код на сайте: {FRONTEND_URL}
+
+---
+PDF Переводчик
+"""
+
+        # HTML version
+        html_content = f"""
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+</head>
+<body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333; max-width: 600px; margin: 0 auto; padding: 20px;">
+    <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 30px; border-radius: 10px; text-align: center; margin-bottom: 30px;">
+        <h1 style="color: white; margin: 0; font-size: 24px;">PDF Переводчик</h1>
+    </div>
+
+    <div style="background: #f8f9fa; padding: 30px; border-radius: 10px; margin-bottom: 20px;">
+        <h2 style="color: #333; margin-top: 0;">Спасибо за покупку!</h2>
+        <p>Ваш код активации:</p>
+        <div style="background: #fff; border: 2px dashed #667eea; padding: 20px; text-align: center; border-radius: 8px; margin: 20px 0;">
+            <span style="font-size: 28px; font-weight: bold; color: #667eea; letter-spacing: 3px;">{invite_code}</span>
+        </div>
+        <table style="width: 100%; margin-top: 20px;">
+            <tr>
+                <td style="padding: 8px 0; color: #666;">Тариф:</td>
+                <td style="padding: 8px 0; font-weight: bold;">{tier}</td>
+            </tr>
+            <tr>
+                <td style="padding: 8px 0; color: #666;">Лимит слов:</td>
+                <td style="padding: 8px 0; font-weight: bold;">{quota_words:,}</td>
+            </tr>
+        </table>
+    </div>
+
+    <div style="text-align: center; margin: 30px 0;">
+        <a href="{FRONTEND_URL}" style="display: inline-block; background: #667eea; color: white; padding: 15px 30px; text-decoration: none; border-radius: 8px; font-weight: bold;">Перейти на сайт</a>
+    </div>
+
+    <div style="text-align: center; color: #999; font-size: 12px; margin-top: 30px; padding-top: 20px; border-top: 1px solid #eee;">
+        <p>PDF Переводчик — качественный перевод книг с сохранением структуры</p>
+    </div>
+</body>
+</html>
+"""
+
+        msg.attach(MIMEText(text_content, "plain", "utf-8"))
+        msg.attach(MIMEText(html_content, "html", "utf-8"))
+
+        # Send email
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASSWORD)
+            server.sendmail(SMTP_FROM, to_email, msg.as_string())
+
+        print(f"[EMAIL] Successfully sent invite code to {to_email}", flush=True)
+        return True
+
+    except Exception as e:
+        print(f"[EMAIL] Failed to send email to {to_email}: {e}", flush=True)
+        return False
+
+
+# ----------------------------
 # Schemas
 # ----------------------------
 class InviteLoginRequest(BaseModel):
@@ -164,6 +264,7 @@ class WalletPayOrderRequest(BaseModel):
 class CryptoBotInvoiceRequest(BaseModel):
     tier: str  # "S", "M", "L"
     asset: str = "USDT"  # USDT or TON
+    email: str | None = None  # Optional email for sending invite code
 
 
 # ----------------------------
@@ -585,9 +686,14 @@ async def stripe_webhook(request: Request, db: Session = Depends(get_db)):
 
             print(f"[STRIPE WEBHOOK] Payment completed! code={payment.invite_code} tier={payment.tier}", flush=True)
 
-            # TODO: Send email with invite code if email provided
+            # Send email with invite code if email provided
             if payment.email:
-                print(f"[STRIPE WEBHOOK] Should send code to {payment.email}", flush=True)
+                send_invite_code_email(
+                    to_email=payment.email,
+                    invite_code=payment.invite_code,
+                    tier=payment.tier,
+                    quota_words=payment.quota_words
+                )
 
     return {"status": "ok"}
 
@@ -874,6 +980,7 @@ def create_cryptobot_invoice(req: CryptoBotInvoiceRequest, db: Session = Depends
             currency=asset,
             payment_method="cryptobot",
             cryptobot_invoice_id=invoice_id,
+            email=req.email,
             status="pending",
         )
         db.add(payment)
@@ -973,6 +1080,15 @@ async def cryptobot_webhook(request: Request, db: Session = Depends(get_db)):
         db.commit()
 
         print(f"[CRYPTOBOT WEBHOOK] Payment completed! code={payment.invite_code} tier={payment.tier}", flush=True)
+
+        # Send email with invite code if email provided
+        if payment.email:
+            send_invite_code_email(
+                to_email=payment.email,
+                invite_code=payment.invite_code,
+                tier=payment.tier,
+                quota_words=payment.quota_words
+            )
 
     return {"status": "ok"}
 
