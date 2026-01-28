@@ -8,6 +8,7 @@ python-multipart
 boto3
 pdfplumber
 requests
+aiohttp
 PyJWT
 stripe
 python-telegram-bot
