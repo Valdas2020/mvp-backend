@@ -392,10 +392,14 @@ def activate_invite(req: InviteActivateRequest, token: str = Query(...), db: Ses
     if hasattr(user, "tier"):
         user.tier = invite.tier
 
+    # Transfer max_pages limit if present (for trial codes)
+    if hasattr(user, "max_pages") and hasattr(invite, "max_pages"):
+        user.max_pages = invite.max_pages
+
     invite.used_count += 1
     db.commit()
 
-    return {"message": "Activated", "tier": getattr(invite, "tier", None)}
+    return {"message": "Activated", "tier": getattr(invite, "tier", None), "max_pages": getattr(invite, "max_pages", None)}
 
 
 # ========================================
@@ -1230,6 +1234,45 @@ try:
             print("[STARTUP] Migration: cryptobot_invoice_id column ready", flush=True)
         except Exception as migration_err:
             print(f"[STARTUP] Migration note: {migration_err}", flush=True)
+
+    # Migration: Add max_pages column to app_users and app_invite_codes
+    with engine.connect() as conn:
+        from sqlalchemy import text
+        try:
+            conn.execute(text("""
+                ALTER TABLE app_users
+                ADD COLUMN IF NOT EXISTS max_pages INTEGER
+            """))
+            conn.execute(text("""
+                ALTER TABLE app_invite_codes
+                ADD COLUMN IF NOT EXISTS max_pages INTEGER
+            """))
+            conn.commit()
+            print("[STARTUP] Migration: max_pages columns ready", flush=True)
+        except Exception as migration_err:
+            print(f"[STARTUP] Migration note (max_pages): {migration_err}", flush=True)
+
+    # Create TEST trial code if it doesn't exist
+    try:
+        db = SessionLocal()
+        test_code = db.query(InviteCode).filter(InviteCode.code == "TEST").first()
+        if not test_code:
+            test_code = InviteCode(
+                code="TEST",
+                tier="TRIAL",
+                quota_words=999999999,  # Unlimited words
+                max_pages=5,  # But limited to 5 pages
+                max_uses=999999,  # Can be used by many users
+                used_count=0
+            )
+            db.add(test_code)
+            db.commit()
+            print("[STARTUP] Created TEST trial code (5 pages limit)", flush=True)
+        else:
+            print("[STARTUP] TEST trial code already exists", flush=True)
+        db.close()
+    except Exception as test_code_err:
+        print(f"[STARTUP] TEST code creation note: {test_code_err}", flush=True)
 
 except Exception as e:
     print(f"[STARTUP] DB init error: {e}", flush=True)

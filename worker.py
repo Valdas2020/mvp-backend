@@ -13,7 +13,7 @@ import requests
 from botocore.client import Config
 from sqlalchemy.orm import Session
 
-from models import SessionLocal, Job  # User/Usage не нужны воркеру прямо сейчас
+from models import SessionLocal, Job, User  # User needed for max_pages check
 
 
 # ----------------------------
@@ -418,6 +418,13 @@ def process_job(db: Session, job: Job):
         with pdfplumber.open(local_input) as pdf:
             total_pages = len(pdf.pages)
         logger.info(f"[{req_id}] PDF pages={total_pages} resume_from_page={last_page_done + 1}")
+
+        # Check user's max_pages limit (for trial codes)
+        user = db.query(User).filter(User.id == job.user_id).first()
+        if user and hasattr(user, "max_pages") and user.max_pages is not None:
+            if total_pages > user.max_pages:
+                logger.info(f"[{req_id}] User has max_pages={user.max_pages}, limiting from {total_pages}")
+                total_pages = user.max_pages
 
         # Write output progressively
         # Храним контекст (хвост) предыдущей страницы для склейки предложений

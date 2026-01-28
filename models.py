@@ -40,6 +40,7 @@ class User(Base):
     email = Column(String, unique=True, index=True)
     plan = Column(String, nullable=True)
     quota_words = Column(Integer, default=0)
+    max_pages = Column(Integer, nullable=True)  # Page limit for trial codes (None = unlimited)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     jobs = relationship("Job", back_populates="user")
@@ -51,6 +52,7 @@ class InviteCode(Base):
     code = Column(String, unique=True, index=True)
     tier = Column(String)
     quota_words = Column(Integer)
+    max_pages = Column(Integer, nullable=True)  # Page limit for trial codes (None = unlimited)
     max_uses = Column(Integer, default=1)
     used_count = Column(Integer, default=0)
 
