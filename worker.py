@@ -421,10 +421,19 @@ def process_job(db: Session, job: Job):
 
         # Check user's max_pages limit (for trial codes)
         user = db.query(User).filter(User.id == job.user_id).first()
-        if user and hasattr(user, "max_pages") and user.max_pages is not None:
-            if total_pages > user.max_pages:
-                logger.info(f"[{req_id}] User has max_pages={user.max_pages}, limiting from {total_pages}")
-                total_pages = user.max_pages
+        user_max_pages = None
+        if user:
+            # Check explicit max_pages limit
+            if hasattr(user, "max_pages") and user.max_pages is not None:
+                user_max_pages = user.max_pages
+            # Fallback: TRIAL tier always limited to 5 pages
+            elif hasattr(user, "tier") and user.tier == "TRIAL":
+                user_max_pages = 5
+                logger.info(f"[{req_id}] TRIAL user without max_pages, defaulting to 5")
+
+        if user_max_pages is not None and total_pages > user_max_pages:
+            logger.info(f"[{req_id}] Limiting pages from {total_pages} to {user_max_pages}")
+            total_pages = user_max_pages
 
         # Write output progressively
         # Храним контекст (хвост) предыдущей страницы для склейки предложений
