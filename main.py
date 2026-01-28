@@ -311,7 +311,7 @@ def invite_login(req: InviteLoginRequest, db: Session = Depends(get_db)):
                 "id": user.id,
                 "email": user.email,
                 "name": getattr(user, "name", "") if hasattr(user, "name") else "",
-                "tier": getattr(user, "tier", None) if hasattr(user, "tier") else None,
+                "tier": getattr(user, "plan", None) if hasattr(user, "plan") else None,
             },
         }
 
@@ -327,9 +327,9 @@ def invite_login(req: InviteLoginRequest, db: Session = Depends(get_db)):
     # Create user WITHOUT invalid kwargs
     user = User(email=user_email)
 
-    # Set tier if column exists on model
-    if hasattr(user, "tier"):
-        setattr(user, "tier", getattr(invite, "tier", None))
+    # Set plan if column exists on model (User has "plan", InviteCode has "tier")
+    if hasattr(user, "plan"):
+        setattr(user, "plan", getattr(invite, "tier", None))
 
     db.add(user)
 
@@ -347,7 +347,7 @@ def invite_login(req: InviteLoginRequest, db: Session = Depends(get_db)):
             "id": user.id,
             "email": user.email,
             "name": getattr(user, "name", "") if hasattr(user, "name") else "",
-            "tier": getattr(user, "tier", None) if hasattr(user, "tier") else None,
+            "tier": getattr(user, "plan", None) if hasattr(user, "plan") else None,
         },
     }
 
@@ -375,7 +375,7 @@ def activate_invite(req: InviteActivateRequest, token: str = Query(...), db: Ses
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    if hasattr(user, "tier") and getattr(user, "tier", None):
+    if hasattr(user, "plan") and getattr(user, "plan", None):
         raise HTTPException(status_code=400, detail="Already activated")
 
     invite = (
@@ -389,8 +389,9 @@ def activate_invite(req: InviteActivateRequest, token: str = Query(...), db: Ses
     if not invite:
         raise HTTPException(status_code=404, detail="Invalid or exhausted invite code")
 
-    if hasattr(user, "tier"):
-        user.tier = invite.tier
+    # Set user plan (note: User model has "plan" field, InviteCode has "tier")
+    if hasattr(user, "plan"):
+        user.plan = invite.tier
 
     # Transfer max_pages limit if present (for trial codes)
     if hasattr(user, "max_pages") and hasattr(invite, "max_pages"):
@@ -399,7 +400,7 @@ def activate_invite(req: InviteActivateRequest, token: str = Query(...), db: Ses
     invite.used_count += 1
     db.commit()
 
-    return {"message": "Activated", "tier": getattr(invite, "tier", None), "max_pages": getattr(invite, "max_pages", None)}
+    return {"message": "Activated", "plan": getattr(invite, "tier", None), "max_pages": getattr(invite, "max_pages", None)}
 
 
 # ========================================
@@ -416,8 +417,8 @@ async def upload_file(
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    if hasattr(user, "tier") and not getattr(user, "tier", None):
-        raise HTTPException(status_code=403, detail="No active tier")
+    if hasattr(user, "plan") and not getattr(user, "plan", None):
+        raise HTTPException(status_code=403, detail="No active plan")
 
     r2_key = f"inputs/{user_id}/{int(time.time())}_{file.filename}"
     content = await file.read()
@@ -526,7 +527,7 @@ def user_info(token: str = Query(...), db: Session = Depends(get_db)):
         "id": user.id,
         "email": user.email,
         "name": getattr(user, "name", "") if hasattr(user, "name") else "",
-        "tier": getattr(user, "tier", None) if hasattr(user, "tier") else None,
+        "tier": getattr(user, "plan", None) if hasattr(user, "plan") else None,
     }
 
 

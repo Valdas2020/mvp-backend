@@ -423,11 +423,12 @@ def process_job(db: Session, job: Job):
         user = db.query(User).filter(User.id == job.user_id).first()
         user_max_pages = None
         if user:
+            logger.info(f"[{req_id}] User id={user.id} plan={getattr(user, 'plan', None)} max_pages={getattr(user, 'max_pages', None)}")
             # Check explicit max_pages limit
             if hasattr(user, "max_pages") and user.max_pages is not None:
                 user_max_pages = user.max_pages
-            # Fallback: TRIAL tier always limited to 5 pages
-            elif hasattr(user, "tier") and user.tier == "TRIAL":
+            # Fallback: TRIAL plan always limited to 5 pages (note: field is "plan" not "tier")
+            elif hasattr(user, "plan") and user.plan == "TRIAL":
                 user_max_pages = 5
                 logger.info(f"[{req_id}] TRIAL user without max_pages, defaulting to 5")
 
