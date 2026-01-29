@@ -309,7 +309,10 @@ async def translate_text_async(
 # ----------------------------
 # Job claiming (sync, runs in thread)
 # ----------------------------
-def requeue_stale_processing(db: Session):
+def requeue_stale_processing(db: Session, active_job_ids: set = None):
+    """Requeue jobs stuck in 'processing' too long, but skip actively running jobs."""
+    if active_job_ids is None:
+        active_job_ids = set()
     try:
         cutoff = datetime.utcnow() - timedelta(minutes=STALE_PROCESSING_MINUTES)
         ts_field = None
@@ -321,14 +324,17 @@ def requeue_stale_processing(db: Session):
         if ts_field is None:
             return
 
-        stale = (
+        stale_jobs = (
             db.query(Job)
             .filter(Job.status == "processing", ts_field < cutoff)
             .order_by(ts_field.asc())
-            .first()
+            .all()
         )
 
-        if stale:
+        for stale in stale_jobs:
+            # Skip jobs that are actively being processed by our async tasks
+            if stale.id in active_job_ids:
+                continue
             logger.warning(f"[job {stale.id}] Re-queuing stale processing job (older than {STALE_PROCESSING_MINUTES}m)")
             stale.status = "queued"
             db.commit()
@@ -571,13 +577,18 @@ async def run_worker_async():
                     logger.error(f"Task for job {jid} failed: {e}")
 
             # Requeue stale jobs
-            requeue_stale_processing(db)
+            requeue_stale_processing(db, active_job_ids=set(active_tasks.keys()))
 
             # Try to claim new jobs if we have capacity
             while len(active_tasks) < MAX_CONCURRENT_JOBS:
                 job = claim_next_job(db)
                 if not job:
                     break
+
+                # Skip if already being processed (race condition guard)
+                if job.id in active_tasks:
+                    logger.warning(f"[job {job.id}] already active, skipping")
+                    continue
 
                 logger.info(f"[job {job.id}] claimed -> processing (active={len(active_tasks)+1}/{MAX_CONCURRENT_JOBS})")
                 task = asyncio.create_task(process_job_async(job.id, semaphore))
