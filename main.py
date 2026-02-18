@@ -304,6 +304,14 @@ def invite_login(req: InviteLoginRequest, db: Session = Depends(get_db)):
     user_email = f"device_{device_id}@local"
     user = db.query(User).filter(User.email == user_email).first()
     if user:
+        # Update plan if user has no active plan (e.g. created before plan logic was added)
+        if hasattr(user, "plan") and not user.plan:
+            user.plan = getattr(invite, "tier", None)
+            if hasattr(user, "max_pages") and hasattr(invite, "max_pages"):
+                user.max_pages = invite.max_pages
+            db.commit()
+            db.refresh(user)
+
         token = create_jwt(user.id, user.email, getattr(user, "name", "") or "")
         return {
             "token": token,
